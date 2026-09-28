@@ -1,40 +1,381 @@
-import AdminLayout from './AdminLayout';
-import { Users, Wrench, Package, AlertTriangle, Clock, CheckCircle, X, TrendingUp } from 'lucide-react';
-import { mockAISafetyAlerts, mockCompletedServices, mockInventory, mockActiveServices, mockServiceRequests } from './mockData';
-import { useState } from 'react';
+import AdminLayout from "./AdminLayout";
+import {
+  Users,
+  Wrench,
+  Package,
+  AlertTriangle,
+  Clock,
+  CheckCircle,
+  X,
+  TrendingUp,
+} from "lucide-react";
+import { useEffect, useState } from "react";
+import { collection, onSnapshot } from "firebase/firestore";
+import { db } from "../firebase";
 
 function AdminDashboard() {
   const [selectedAlert, setSelectedAlert] = useState(null);
-  const getStoredData = (key, fallback) => {
-  const saved = localStorage.getItem(key);
 
-  if (!saved) {
-    return fallback;
-  }
+  const [users, setUsers] = useState([]);
+  const [motorcycles, setMotorcycles] = useState([]);
+  const [serviceRequests, setServiceRequests] = useState([]);
+  const [inventory, setInventory] = useState([]);
+  const [aiSafetyAlerts, setAiSafetyAlerts] = useState([]);
 
-  try {
-    return JSON.parse(saved);
-  } catch {
-    return fallback;
-  }
-};
+  useEffect(() => {
+    const unsubscribeUsers = onSnapshot(
+      collection(db, "users"),
+      (snapshot) => {
+        const data = snapshot.docs.map((doc) => ({
+          id: doc.id,
+          ...doc.data(),
+        }));
 
-const [inventory] = useState(() =>
-  getStoredData('umes_inventory', mockInventory)
-);
+        setUsers(data);
+      },
+      (error) => {
+        console.error("Error loading users:", error);
+        setUsers([]);
+      }
+    );
 
-const [activeServices] = useState(() =>
-  getStoredData('umes_active_services', mockActiveServices)
-);
+    const unsubscribeMotorcycles = onSnapshot(
+      collection(db, "motorcycles"),
+      (snapshot) => {
+        const data = snapshot.docs.map((doc) => ({
+          id: doc.id,
+          ...doc.data(),
+        }));
 
-const [serviceRequests] = useState(() =>
-  getStoredData('umes_service_requests', mockServiceRequests)
-);
+        setMotorcycles(data);
+      },
+      (error) => {
+        console.error("Error loading motorcycles:", error);
+        setMotorcycles([]);
+      }
+    );
 
-  const lowStockItems = inventory.filter(item => item.quantity < item.minStock);
-  const newAlerts = mockAISafetyAlerts.filter(alert => alert.status === 'New');
-  const pendingRequests = serviceRequests.filter(req => req.status === 'pending');
-  const recentServices = mockCompletedServices.slice(0, 5);
+    const unsubscribeServices = onSnapshot(
+      collection(db, "services"),
+      (snapshot) => {
+        const data = snapshot.docs.map((doc) => ({
+          id: doc.id,
+          ...doc.data(),
+        }));
+
+        setServiceRequests(data);
+      },
+      (error) => {
+        console.error("Error loading services:", error);
+        setServiceRequests([]);
+      }
+    );
+
+    const unsubscribeInventory = onSnapshot(
+      collection(db, "inventory"),
+      (snapshot) => {
+        const data = snapshot.docs.map((doc) => ({
+          id: doc.id,
+          ...doc.data(),
+        }));
+
+        setInventory(data);
+      },
+      (error) => {
+        console.error("Error loading inventory:", error);
+        setInventory([]);
+      }
+    );
+
+    const unsubscribeAlerts = onSnapshot(
+      collection(db, "aiAlerts"),
+      (snapshot) => {
+        const data = snapshot.docs.map((doc) => ({
+          id: doc.id,
+          ...doc.data(),
+        }));
+
+        setAiSafetyAlerts(data);
+      },
+      (error) => {
+        console.error("Error loading AI alerts:", error);
+        setAiSafetyAlerts([]);
+      }
+    );
+
+    return () => {
+      unsubscribeUsers();
+      unsubscribeMotorcycles();
+      unsubscribeServices();
+      unsubscribeInventory();
+      unsubscribeAlerts();
+    };
+  }, []);
+
+  const normalizeStatus = (value) => {
+    return String(value || "")
+      .toLowerCase()
+      .replace(/_/g, " ")
+      .trim();
+  };
+
+  const formatDate = (value) => {
+    if (!value) return "";
+
+    try {
+      if (typeof value?.toDate === "function") {
+        return value.toDate().toISOString().split("T")[0];
+      }
+
+      if (value instanceof Date) {
+        return value.toISOString().split("T")[0];
+      }
+
+      const parsed = new Date(value);
+
+      if (!Number.isNaN(parsed.getTime())) {
+        return parsed.toISOString().split("T")[0];
+      }
+
+      return String(value);
+    } catch {
+      return String(value);
+    }
+  };
+
+  const getTimestamp = (value) => {
+    if (!value) return 0;
+
+    try {
+      if (typeof value?.toDate === "function") {
+        return value.toDate().getTime();
+      }
+
+      if (value instanceof Date) {
+        return value.getTime();
+      }
+
+      const parsed = new Date(value).getTime();
+
+      return Number.isNaN(parsed) ? 0 : parsed;
+    } catch {
+      return 0;
+    }
+  };
+
+  const formatMotorcycle = (motorcycle) => {
+    if (!motorcycle) {
+      return "";
+    }
+
+    if (typeof motorcycle === "string") {
+      return motorcycle;
+    }
+
+    if (typeof motorcycle === "object") {
+      const parts = [
+        motorcycle.brand,
+        motorcycle.model,
+        motorcycle.year ? `(${motorcycle.year})` : "",
+      ].filter(Boolean);
+
+      return parts.join(" ");
+    }
+
+    return String(motorcycle);
+  };
+
+  const usersById = users.reduce((result, user) => {
+    result[user.id] = user;
+    return result;
+  }, {});
+
+  const motorcyclesById = motorcycles.reduce((result, motorcycle) => {
+    result[motorcycle.id] = motorcycle;
+    return result;
+  }, {});
+
+  const totalCustomers = users.filter((user) => {
+    const role = String(user.role || "").toLowerCase();
+
+    return role === "customer";
+  }).length;
+
+  const servicesWithDisplayData = serviceRequests.map((service) => {
+    const customer =
+      usersById[service.customerId] ||
+      usersById[service.userId] ||
+      usersById[service.userUid] ||
+      usersById[service.uid];
+
+    const motorcycleData =
+      service.motorcycle ||
+      motorcyclesById[service.motorcycleId] ||
+      null;
+
+    const customerName =
+      service.customerName ||
+      service.fullName ||
+      service.customerFullName ||
+      customer?.fullName ||
+      customer?.name ||
+      "Customer";
+
+    const motorcycle =
+      service.motorcycleName ||
+      (typeof service.motorcycle === "string"
+        ? service.motorcycle
+        : formatMotorcycle(motorcycleData));
+
+    const requestDate =
+      service.requestDate ||
+      service.createdDate ||
+      formatDate(service.createdAt);
+
+    const preferredDate =
+      service.preferredDate ||
+      service.date ||
+      service.scheduleDate ||
+      "";
+
+    const preferredTime =
+      service.preferredTime ||
+      service.time ||
+      service.scheduleTime ||
+      "";
+
+    const cost = Number(
+      service.cost ??
+        service.finalCost ??
+        service.estimatedCost ??
+        service.amount ??
+        0
+    );
+
+    const rating = Number(service.rating || 0);
+
+    return {
+      ...service,
+      customerName,
+      motorcycle,
+      requestDate,
+      preferredDate,
+      preferredTime,
+      cost,
+      rating,
+    };
+  });
+
+  const activeServices = servicesWithDisplayData.filter((service) => {
+    const status = normalizeStatus(service.status);
+
+    return [
+      "active",
+      "in progress",
+      "waiting for parts",
+      "waiting for part",
+      "quality check",
+    ].includes(status);
+  });
+
+  const pendingRequests = servicesWithDisplayData.filter((service) => {
+    const status = normalizeStatus(service.status);
+
+    return [
+      "pending",
+      "pending approval",
+      "pending approval request",
+    ].includes(status);
+  });
+
+  const completedServices = servicesWithDisplayData.filter((service) => {
+    const status = normalizeStatus(service.status);
+
+    return status === "completed";
+  });
+
+  const recentServices = [...completedServices]
+    .sort((a, b) => {
+      const dateA =
+        getTimestamp(a.completedAt) ||
+        getTimestamp(a.completedDate) ||
+        getTimestamp(a.createdAt) ||
+        getTimestamp(a.requestDate);
+
+      const dateB =
+        getTimestamp(b.completedAt) ||
+        getTimestamp(b.completedDate) ||
+        getTimestamp(b.createdAt) ||
+        getTimestamp(b.requestDate);
+
+      return dateB - dateA;
+    })
+    .slice(0, 5);
+
+  const lowStockItems = inventory.filter((item) => {
+    const quantity = Number(item.quantity || 0);
+    const minStock = Number(item.minStock || 0);
+
+    return quantity < minStock;
+  });
+
+  const newAlerts = aiSafetyAlerts
+    .map((alert) => {
+      const customer =
+        usersById[alert.customerId] ||
+        usersById[alert.userId] ||
+        usersById[alert.userUid];
+
+      const motorcycleData =
+        alert.motorcycle ||
+        motorcyclesById[alert.motorcycleId] ||
+        null;
+
+      return {
+        ...alert,
+
+        customerName:
+          alert.customerName ||
+          alert.fullName ||
+          customer?.fullName ||
+          customer?.name ||
+          "Customer",
+
+        motorcycle:
+          typeof alert.motorcycle === "string"
+            ? alert.motorcycle
+            : alert.motorcycleName ||
+              formatMotorcycle(motorcycleData),
+
+        riskLevel:
+          alert.riskLevel ||
+          alert.risk ||
+          "WARNING",
+
+        status: alert.status || "New",
+
+        modification:
+          alert.modification ||
+          alert.configuration ||
+          alert.selectedModification ||
+          "Motorcycle modification",
+
+        issue:
+          alert.issue ||
+          alert.detectedIssue ||
+          alert.description ||
+          "No issue details available.",
+
+        recommendation:
+          alert.recommendation ||
+          alert.aiRecommendation ||
+          alert.recommendedAction ||
+          "No recommendation available.",
+      };
+    })
+    .filter((alert) => {
+      return normalizeStatus(alert.status) === "new";
+    });
 
   return (
     <AdminLayout title="Dashboard">
@@ -76,7 +417,7 @@ const [serviceRequests] = useState(() =>
                 <span>Active</span>
               </div>
             </div>
-            <p className="text-3xl font-bold text-gray-900 leading-none">156</p>
+            <p className="text-3xl font-bold text-gray-900 leading-none">{totalCustomers}</p>
             <p className="text-xs text-gray-400 mt-1.5">Registered customers</p>
           </div>
 
@@ -166,7 +507,7 @@ const [serviceRequests] = useState(() =>
                 <p className="text-xs text-gray-700">{service.serviceType}</p>
                 <div className="flex items-center justify-between mt-1.5">
                   <span className="text-xs text-amber-500">{'★'.repeat(service.rating)}</span>
-                  <span className="text-xs text-gray-600 font-medium">₱{(service.cost * 50).toLocaleString()}</span>
+                  <span className="text-xs text-gray-600 font-medium">₱{Number(service.cost || 0).toLocaleString()}</span>
                 </div>
               </div>
             ))}
@@ -184,7 +525,7 @@ const [serviceRequests] = useState(() =>
             <h3 className="text-sm font-semibold text-gray-800">AI Safety Alerts</h3>
           </div>
           <div className="p-4 space-y-2">
-            {mockAISafetyAlerts.slice(0, 3).map(alert => (
+            {newAlerts.slice(0, 3).map(alert => (
               <button
                 key={alert.id}
                 onClick={() => setSelectedAlert(alert)}

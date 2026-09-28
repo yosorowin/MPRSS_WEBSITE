@@ -1,8 +1,9 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import AdminLayout from "./AdminLayout";
 import { Search, MessageSquare, History, X } from "lucide-react";
-import { mockCustomers } from "./mockData";
 import { useNavigate } from "react-router-dom";
+import { collection, onSnapshot } from "firebase/firestore";
+import { db } from "../firebase";
 
 function AdminCustomers() {
   const navigate = useNavigate();
@@ -12,10 +13,297 @@ function AdminCustomers() {
   const [showHistoryModal, setShowHistoryModal] = useState(false);
   const [showMessageModal, setShowMessageModal] = useState(false);
 
-  const filteredCustomers = mockCustomers.filter(
+  const [users, setUsers] = useState([]);
+  const [motorcycles, setMotorcycles] = useState([]);
+  const [services, setServices] = useState([]);
+
+  useEffect(() => {
+    const unsubscribeUsers = onSnapshot(
+      collection(db, "users"),
+      (snapshot) => {
+        const customerUsers = snapshot.docs
+          .map((doc) => ({
+            id: doc.id,
+            ...doc.data(),
+          }))
+          .filter((user) => {
+            return String(user.role || "").toLowerCase() === "customer";
+          });
+
+        setUsers(customerUsers);
+      },
+      (error) => {
+        console.error("Error loading customers:", error);
+        setUsers([]);
+      }
+    );
+
+    const unsubscribeMotorcycles = onSnapshot(
+      collection(db, "motorcycles"),
+      (snapshot) => {
+        const data = snapshot.docs.map((doc) => ({
+          id: doc.id,
+          ...doc.data(),
+        }));
+
+        setMotorcycles(data);
+      },
+      (error) => {
+        console.error("Error loading motorcycles:", error);
+        setMotorcycles([]);
+      }
+    );
+
+    const unsubscribeServices = onSnapshot(
+      collection(db, "services"),
+      (snapshot) => {
+        const data = snapshot.docs.map((doc) => ({
+          id: doc.id,
+          ...doc.data(),
+        }));
+
+        setServices(data);
+      },
+      (error) => {
+        console.error("Error loading services:", error);
+        setServices([]);
+      }
+    );
+
+    return () => {
+      unsubscribeUsers();
+      unsubscribeMotorcycles();
+      unsubscribeServices();
+    };
+  }, []);
+
+  const formatDate = (value) => {
+    if (!value) {
+      return "";
+    }
+
+    try {
+      if (typeof value?.toDate === "function") {
+        return value.toDate().toLocaleDateString("en-PH");
+      }
+
+      if (value instanceof Date) {
+        return value.toLocaleDateString("en-PH");
+      }
+
+      const parsedDate = new Date(value);
+
+      if (!Number.isNaN(parsedDate.getTime())) {
+        return parsedDate.toLocaleDateString("en-PH");
+      }
+
+      return String(value);
+    } catch {
+      return String(value);
+    }
+  };
+
+  const getTimestamp = (value) => {
+    if (!value) {
+      return 0;
+    }
+
+    try {
+      if (typeof value?.toDate === "function") {
+        return value.toDate().getTime();
+      }
+
+      if (value instanceof Date) {
+        return value.getTime();
+      }
+
+      const parsedDate = new Date(value).getTime();
+
+      return Number.isNaN(parsedDate) ? 0 : parsedDate;
+    } catch {
+      return 0;
+    }
+  };
+
+  const getCustomerMotorcycles = (customer) => {
+    return motorcycles.filter((motorcycle) => {
+      const ownerId =
+        motorcycle.userId ||
+        motorcycle.customerId ||
+        motorcycle.ownerId ||
+        motorcycle.userUid ||
+        motorcycle.customerUid;
+
+      if (ownerId && ownerId === customer.id) {
+        return true;
+      }
+
+      if (
+        motorcycle.userEmail &&
+        customer.email &&
+        motorcycle.userEmail.toLowerCase() ===
+          customer.email.toLowerCase()
+      ) {
+        return true;
+      }
+
+      if (
+        motorcycle.customerEmail &&
+        customer.email &&
+        motorcycle.customerEmail.toLowerCase() ===
+          customer.email.toLowerCase()
+      ) {
+        return true;
+      }
+
+      return false;
+    });
+  };
+
+  const serviceBelongsToCustomer = (service, customer) => {
+    const customerId =
+      service.customerId ||
+      service.userId ||
+      service.userUid ||
+      service.customerUid ||
+      service.uid;
+
+    if (customerId && customerId === customer.id) {
+      return true;
+    }
+
+    if (
+      service.customerEmail &&
+      customer.email &&
+      service.customerEmail.toLowerCase() === customer.email.toLowerCase()
+    ) {
+      return true;
+    }
+
+    if (
+      service.userEmail &&
+      customer.email &&
+      service.userEmail.toLowerCase() === customer.email.toLowerCase()
+    ) {
+      return true;
+    }
+
+    return false;
+  };
+
+  const getCustomerServices = (customer) => {
+    return services
+      .filter((service) =>
+        serviceBelongsToCustomer(service, customer)
+      )
+      .sort((a, b) => {
+        const dateA =
+          getTimestamp(a.completedAt) ||
+          getTimestamp(a.completedDate) ||
+          getTimestamp(a.createdAt) ||
+          getTimestamp(a.requestDate);
+
+        const dateB =
+          getTimestamp(b.completedAt) ||
+          getTimestamp(b.completedDate) ||
+          getTimestamp(b.createdAt) ||
+          getTimestamp(b.requestDate);
+
+        return dateB - dateA;
+      });
+  };
+
+  const getServiceAmount = (service) => {
+    return Number(
+      service.amount ??
+        service.finalCost ??
+        service.cost ??
+        service.actualCost ??
+        service.estimatedCost ??
+        0
+    );
+  };
+
+  const getCustomerData = (customer) => {
+    const customerMotorcycles = getCustomerMotorcycles(customer);
+    const customerServices = getCustomerServices(customer);
+
+    const completedServices = customerServices.filter((service) => {
+      const status = String(service.status || "")
+        .toLowerCase()
+        .replace(/_/g, " ")
+        .trim();
+
+      return status === "completed";
+    });
+
+    const totalSpent = completedServices.reduce((total, service) => {
+      return total + getServiceAmount(service);
+    }, 0);
+
+    const serviceHistoryDetails = completedServices.map((service) => ({
+      id: service.id,
+
+      date:
+        formatDate(service.completedAt) ||
+        formatDate(service.completedDate) ||
+        formatDate(service.createdAt) ||
+        formatDate(service.requestDate) ||
+        "—",
+
+      serviceType:
+        service.serviceType ||
+        service.serviceName ||
+        service.type ||
+        "Service",
+
+      amount: getServiceAmount(service),
+    }));
+
+    return {
+      id: customer.id,
+
+      name:
+        customer.fullName ||
+        customer.name ||
+        "Unnamed Customer",
+
+      email:
+        customer.email ||
+        "",
+
+      mobile:
+        customer.mobile ||
+        customer.mobileNumber ||
+        customer.phone ||
+        "",
+
+      registeredDate:
+        formatDate(customer.createdAt) ||
+        formatDate(customer.registeredAt) ||
+        formatDate(customer.dateRegistered) ||
+        "—",
+
+      motorcycles: customerMotorcycles,
+
+      serviceHistory: completedServices.length,
+
+      totalSpent,
+
+      serviceHistoryDetails,
+    };
+  };
+
+  const customers = users.map(getCustomerData);
+
+  const filteredCustomers = customers.filter(
     (customer) =>
-      customer.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      customer.email.toLowerCase().includes(searchTerm.toLowerCase())
+      customer.name
+        .toLowerCase()
+        .includes(searchTerm.toLowerCase()) ||
+      customer.email
+        .toLowerCase()
+        .includes(searchTerm.toLowerCase())
   );
 
   const handleSendMessage = () => {

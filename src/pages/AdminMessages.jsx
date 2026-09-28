@@ -1,195 +1,452 @@
-import { useState, useEffect } from "react";
+import { useEffect, useState } from "react";
 import AdminLayout from "./AdminLayout";
 import { Send, ArrowLeft } from "lucide-react";
-import { mockMessages } from "./mockData";
+
+import {
+  arrayUnion,
+  collection,
+  doc,
+  onSnapshot,
+  serverTimestamp,
+  updateDoc,
+} from "firebase/firestore";
+
+import { db } from "../firebase";
 
 export default function AdminMessages() {
   const [chats, setChats] = useState([]);
   const [selectedChatId, setSelectedChatId] = useState(null);
   const [messageText, setMessageText] = useState("");
 
+  const [loading, setLoading] = useState(true);
+  const [firestoreError, setFirestoreError] = useState("");
+
+  /*
+   * ============================================================
+   * FIRESTORE REAL-TIME MESSAGES
+   * ============================================================
+   */
+
   useEffect(() => {
-    const loadMessages = () => {
-      const saved = localStorage.getItem("mprss_messages");
-      const allChats = saved ? JSON.parse(saved) : mockMessages;
+    const unsubscribeMessages = onSnapshot(
+      collection(db, "messages"),
+      (snapshot) => {
+        const data = snapshot.docs.map((messageDoc) => ({
+          id: messageDoc.id,
+          ...messageDoc.data(),
+        }));
 
-      setChats(allChats);
+        // Sort conversations by latest update
+        data.sort((a, b) => {
+          const getTime = (value) => {
+            if (!value) return 0;
 
-      if (!saved) {
-        localStorage.setItem(
-          "mprss_messages",
-          JSON.stringify(mockMessages)
+            if (typeof value.toMillis === "function") {
+              return value.toMillis();
+            }
+
+            if (value instanceof Date) {
+              return value.getTime();
+            }
+
+            const parsed = new Date(value).getTime();
+
+            return Number.isNaN(parsed) ? 0 : parsed;
+          };
+
+          return (
+            getTime(b.updatedAt) -
+            getTime(a.updatedAt)
+          );
+        });
+
+        setChats(data);
+        setLoading(false);
+        setFirestoreError("");
+      },
+      (error) => {
+        console.error(
+          "MESSAGES FIRESTORE ERROR:",
+          error
         );
+
+        setChats([]);
+        setLoading(false);
+        setFirestoreError(error.message);
       }
-    };
+    );
 
-    loadMessages();
-
-    const interval = setInterval(loadMessages, 2000);
-
-    return () => clearInterval(interval);
+    return () => unsubscribeMessages();
   }, []);
 
-  const selectedChat =
-    chats.find((chat) => chat.id === selectedChatId) || null;
+  /*
+   * ============================================================
+   * SELECTED CHAT
+   * ============================================================
+   */
 
-  const handleSelectChat = (chatId) => {
+  const selectedChat =
+    chats.find(
+      (chat) => chat.id === selectedChatId
+    ) || null;
+
+  /*
+   * ============================================================
+   * SELECT CHAT
+   * ============================================================
+   */
+
+  const handleSelectChat = async (chatId) => {
     setSelectedChatId(chatId);
 
-    const updatedChats = chats.map((chat) =>
-      chat.id === chatId
-        ? { ...chat, unread: 0 }
-        : chat
+    const chat = chats.find(
+      (item) => item.id === chatId
     );
 
-    setChats(updatedChats);
+    if (!chat) {
+      return;
+    }
 
-    localStorage.setItem(
-      "mprss_messages",
-      JSON.stringify(updatedChats)
-    );
+    // Reset unread count in Firestore
+    if (Number(chat.unread || 0) > 0) {
+      try {
+        const chatRef = doc(
+          db,
+          "messages",
+          chatId
+        );
+
+        await updateDoc(chatRef, {
+          unread: 0,
+          updatedAt: serverTimestamp(),
+        });
+      } catch (error) {
+        console.error(
+          "Error marking conversation as read:",
+          error
+        );
+      }
+    }
   };
 
-  const handleSend = () => {
-    if (messageText.trim() && selectedChat) {
-      const newMessage = {
-        sender: "admin",
-        text: messageText,
-        timestamp: new Date().toLocaleString("en-US", {
-          hour: "2-digit",
-          minute: "2-digit",
-          hour12: false,
-        }),
-      };
+  /*
+   * ============================================================
+   * SEND MESSAGE
+   * ============================================================
+   */
 
-      const updatedChats = chats.map((chat) =>
-        chat.id === selectedChatId
-          ? {
-              ...chat,
-              messages: [...chat.messages, newMessage],
-            }
-          : chat
+  const handleSend = async () => {
+    if (
+      !messageText.trim() ||
+      !selectedChat
+    ) {
+      return;
+    }
+
+    const trimmedMessage =
+      messageText.trim();
+
+    const newMessage = {
+      sender: "admin",
+      text: trimmedMessage,
+
+      // Simple readable timestamp
+      timestamp: new Date().toISOString(),
+    };
+
+    try {
+      const chatRef = doc(
+        db,
+        "messages",
+        selectedChat.id
       );
 
-      setChats(updatedChats);
+      await updateDoc(chatRef, {
+        messages: arrayUnion(newMessage),
 
-      localStorage.setItem(
-        "mprss_messages",
-        JSON.stringify(updatedChats)
-      );
+        /*
+         * Updated so the conversation moves
+         * to the top of the list.
+         */
+        updatedAt: serverTimestamp(),
+
+        /*
+         * Admin is sending the message,
+         * so admin unread stays at 0.
+         */
+        unread: 0,
+      });
 
       setMessageText("");
+    } catch (error) {
+      console.error(
+        "Error sending message:",
+        error
+      );
+
+      alert(
+        "Failed to send message. Check the browser console for details."
+      );
+    }
+  };
+
+  /*
+   * ============================================================
+   * FORMAT MESSAGE TIME
+   * ============================================================
+   */
+
+  const formatMessageTime = (timestamp) => {
+    if (!timestamp) {
+      return "";
+    }
+
+    try {
+      let date;
+
+      if (
+        typeof timestamp?.toDate ===
+        "function"
+      ) {
+        date = timestamp.toDate();
+      } else {
+        date = new Date(timestamp);
+      }
+
+      if (Number.isNaN(date.getTime())) {
+        return String(timestamp);
+      }
+
+      return date.toLocaleString("en-US", {
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+      });
+    } catch {
+      return String(timestamp);
     }
   };
 
   return (
     <AdminLayout title="Messages">
+
+      {/* ======================================================
+          FIRESTORE ERROR
+      ======================================================= */}
+
+      {firestoreError && (
+        <div className="bg-red-50 border border-red-200 text-red-700 rounded-xl p-4 mb-6 text-sm">
+          <strong>Firestore Error:</strong>{" "}
+          {firestoreError}
+        </div>
+      )}
+
+      {/* ======================================================
+          LOADING
+      ======================================================= */}
+
+      {loading && (
+        <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-6 mb-6 text-sm text-gray-500">
+          Loading conversations...
+        </div>
+      )}
+
+      {/* ======================================================
+          MESSAGES LAYOUT
+      ======================================================= */}
+
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 h-[calc(100vh-200px)]">
 
-        {/* Chat List */}
+        {/* ====================================================
+            CHAT LIST
+        ===================================================== */}
+
         <div className="bg-white rounded-lg shadow overflow-hidden">
+
           <div className="p-4 border-b border-gray-200">
-            <h3 className="text-lg">Conversations</h3>
+            <h3 className="text-lg">
+              Conversations
+            </h3>
           </div>
 
           <div className="overflow-y-auto h-full">
-            {chats.map((chat) => (
-              <div
-                key={chat.id}
-                onClick={() => handleSelectChat(chat.id)}
-                className={`p-4 border-b border-gray-100 cursor-pointer hover:bg-gray-50 ${
-                  selectedChatId === chat.id
-                    ? "bg-gray-50"
-                    : ""
-                }`}
-              >
-                <div className="flex justify-between items-start">
-                  <p className="font-medium">
-                    {chat.customerName}
-                  </p>
 
-                  {chat.unread > 0 && (
-                    <span className="bg-black text-white text-xs px-2 py-1 rounded-full">
-                      {chat.unread}
-                    </span>
-                  )}
-                </div>
-
-                <p className="text-sm text-gray-600 mt-1 truncate">
-                  {chat.messages.length > 0
-                    ? chat.messages[chat.messages.length - 1].text
-                    : "No messages yet"}
-                </p>
+            {chats.length === 0 ? (
+              <div className="p-6 text-center text-gray-500 text-sm">
+                No conversations yet.
               </div>
-            ))}
+            ) : (
+              chats.map((chat) => {
+
+                const chatMessages =
+                  Array.isArray(
+                    chat.messages
+                  )
+                    ? chat.messages
+                    : [];
+
+                const lastMessage =
+                  chatMessages.length > 0
+                    ? chatMessages[
+                        chatMessages.length - 1
+                      ]
+                    : null;
+
+                return (
+                  <div
+                    key={chat.id}
+                    onClick={() =>
+                      handleSelectChat(
+                        chat.id
+                      )
+                    }
+                    className={`p-4 border-b border-gray-100 cursor-pointer hover:bg-gray-50 ${
+                      selectedChatId ===
+                      chat.id
+                        ? "bg-gray-50"
+                        : ""
+                    }`}
+                  >
+
+                    <div className="flex justify-between items-start">
+
+                      <p className="font-medium">
+                        {chat.customerName ||
+                          "Customer"}
+                      </p>
+
+                      {Number(
+                        chat.unread || 0
+                      ) > 0 && (
+                        <span className="bg-black text-white text-xs px-2 py-1 rounded-full">
+                          {chat.unread}
+                        </span>
+                      )}
+
+                    </div>
+
+                    <p className="text-sm text-gray-600 mt-1 truncate">
+                      {lastMessage
+                        ? lastMessage.text
+                        : "No messages yet"}
+                    </p>
+
+                  </div>
+                );
+              })
+            )}
+
           </div>
         </div>
 
-        {/* Chat Area */}
+        {/* ====================================================
+            CHAT AREA
+        ===================================================== */}
+
         <div className="lg:col-span-2 bg-white rounded-lg shadow flex flex-col">
+
           {selectedChat ? (
             <>
               {/* Chat Header */}
               <div className="p-4 border-b border-gray-200 flex items-center gap-3">
+
                 <button
-                  onClick={() => setSelectedChatId(null)}
+                  onClick={() =>
+                    setSelectedChatId(null)
+                  }
                   className="lg:hidden text-gray-500 hover:text-gray-700"
                 >
                   <ArrowLeft size={20} />
                 </button>
 
-                <h3 className="text-lg font-medium">
-                  {selectedChat.customerName}
-                </h3>
+                <div>
+                  <h3 className="text-lg font-medium">
+                    {selectedChat.customerName ||
+                      "Customer"}
+                  </h3>
+
+                  {selectedChat.customerEmail && (
+                    <p className="text-xs text-gray-500">
+                      {selectedChat.customerEmail}
+                    </p>
+                  )}
+                </div>
+
               </div>
 
               {/* Messages */}
               <div className="flex-1 overflow-y-auto p-4 space-y-4">
-                {selectedChat.messages.map((msg, idx) => (
-                  <div
-                    key={idx}
-                    className={`flex ${
-                      msg.sender === "admin"
-                        ? "justify-end"
-                        : "justify-start"
-                    }`}
-                  >
-                    <div
-                      className={`max-w-xs lg:max-w-md px-4 py-2 rounded-lg ${
-                        msg.sender === "admin"
-                          ? "bg-black text-white"
-                          : "bg-gray-100 text-gray-900"
-                      }`}
-                    >
-                      <p className="text-sm">
-                        {msg.text}
-                      </p>
 
-                      <p
-                        className={`text-xs mt-1 ${
+                {Array.isArray(
+                  selectedChat.messages
+                ) &&
+                selectedChat.messages.length > 0 ? (
+                  selectedChat.messages.map(
+                    (msg, idx) => (
+                      <div
+                        key={`${selectedChat.id}-${idx}`}
+                        className={`flex ${
                           msg.sender === "admin"
-                            ? "text-gray-300"
-                            : "text-gray-500"
+                            ? "justify-end"
+                            : "justify-start"
                         }`}
                       >
-                        {msg.timestamp}
-                      </p>
-                    </div>
+
+                        <div
+                          className={`max-w-xs lg:max-w-md px-4 py-2 rounded-lg ${
+                            msg.sender ===
+                            "admin"
+                              ? "bg-black text-white"
+                              : "bg-gray-100 text-gray-900"
+                          }`}
+                        >
+
+                          <p className="text-sm">
+                            {msg.text}
+                          </p>
+
+                          <p
+                            className={`text-xs mt-1 ${
+                              msg.sender ===
+                              "admin"
+                                ? "text-gray-300"
+                                : "text-gray-500"
+                            }`}
+                          >
+                            {formatMessageTime(
+                              msg.timestamp
+                            )}
+                          </p>
+
+                        </div>
+                      </div>
+                    )
+                  )
+                ) : (
+                  <div className="text-center text-gray-400 text-sm py-10">
+                    No messages yet.
                   </div>
-                ))}
+                )}
+
               </div>
 
               {/* Message Input */}
               <div className="p-4 border-t border-gray-200">
+
                 <div className="flex gap-2">
+
                   <input
                     type="text"
                     value={messageText}
                     onChange={(e) =>
-                      setMessageText(e.target.value)
+                      setMessageText(
+                        e.target.value
+                      )
                     }
                     onKeyDown={(e) => {
-                      if (e.key === "Enter") {
+                      if (
+                        e.key === "Enter"
+                      ) {
                         handleSend();
                       }
                     }}
@@ -199,11 +456,16 @@ export default function AdminMessages() {
 
                   <button
                     onClick={handleSend}
-                    className="px-4 py-2 bg-black text-white rounded-md hover:bg-gray-800"
+                    disabled={
+                      !messageText.trim()
+                    }
+                    className="px-4 py-2 bg-black text-white rounded-md hover:bg-gray-800 disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     <Send size={20} />
                   </button>
+
                 </div>
+
               </div>
             </>
           ) : (
@@ -211,6 +473,7 @@ export default function AdminMessages() {
               Select a conversation to start messaging
             </div>
           )}
+
         </div>
       </div>
     </AdminLayout>

@@ -1,247 +1,1203 @@
-import { useState } from 'react';
+import { useEffect, useState } from "react";
 import AdminLayout from "./AdminLayout";
-import { ChevronLeft, ChevronRight, X, Ban, Users, Wrench, Calendar, Clock, Plus } from "lucide-react";
-import { mockShopSchedule, mockCustomers } from "./mockData";
+import {
+  ChevronLeft,
+  ChevronRight,
+  X,
+  Ban,
+  Users,
+  Wrench,
+  Calendar,
+  Clock,
+  Plus,
+} from "lucide-react";
+import {
+  collection,
+  doc,
+  onSnapshot,
+  runTransaction,
+  serverTimestamp,
+} from "firebase/firestore";
+import { db } from "../firebase";
 
-const todayStr = new Date().toISOString().split('T')[0];
+const todayStr = new Date().toISOString().split("T")[0];
+
+const DAILY_CAPACITY = 5;
+
+const TIME_SLOTS = [
+  "8:00 AM",
+  "9:00 AM",
+  "10:00 AM",
+  "11:00 AM",
+  "12:00 PM",
+  "1:00 PM",
+  "2:00 PM",
+  "3:00 PM",
+  "4:00 PM",
+  "5:00 PM",
+  "6:00 PM",
+  "7:00 PM",
+  "8:00 PM",
+  "9:00 PM",
+  "10:00 PM",
+];
 
 function AdminSchedule() {
-  const [shopSchedule, setShopSchedule] = useState(() => {
-    const saved = localStorage.getItem('umes_shop_schedule');
-    if (saved) return JSON.parse(saved);
-    return mockShopSchedule;
+  const [shopSchedule, setShopSchedule] = useState({
+    dailyCapacity: DAILY_CAPACITY,
+    timeSlots: TIME_SLOTS,
+    bookedSlots: {},
   });
 
   const [currentMonth, setCurrentMonth] = useState(new Date());
   const [selectedDate, setSelectedDate] = useState(todayStr);
   const [showBlockModal, setShowBlockModal] = useState(false);
-  const [blockForm, setBlockForm] = useState({ timeSlot: '', reason: '' });
+  const [blockForm, setBlockForm] = useState({
+    timeSlot: "",
+    reason: "",
+  });
 
   const [showAddModal, setShowAddModal] = useState(false);
-  const [addForm, setAddForm] = useState({
-    customerId: '',
-    customerName: '',
-    motorcycleId: '',
-    motorcycle: '',
-    serviceType: '',
-    date: todayStr,
-    time: '',
-    assignedStaff: '',
-    notes: '',
-    otherBrand: '',
-    otherModel: '',
-    otherPlate: '',
-    otherYear: ''
-  });
-  const [addCustomerMotorcycles, setAddCustomerMotorcycles] = useState([]);
 
-  const allCustomers = (() => {
-    const saved = localStorage.getItem('registeredUsers');
-    if (saved) {
-      const users = JSON.parse(saved);
-      const customers = users.filter((u) => u.role === 'customer' || !u.role);
-      if (customers.length > 0) return customers;
+  const [addForm, setAddForm] = useState({
+    customerId: "",
+    customerName: "",
+    motorcycleId: "",
+    motorcycle: "",
+    serviceType: "",
+    date: todayStr,
+    time: "",
+    assignedStaff: "",
+    assignedStaffId: "",
+    notes: "",
+    otherBrand: "",
+    otherModel: "",
+    otherPlate: "",
+    otherYear: "",
+  });
+
+  const [addCustomerMotorcycles, setAddCustomerMotorcycles] =
+    useState([]);
+
+  const [users, setUsers] = useState([]);
+  const [motorcycles, setMotorcycles] = useState([]);
+  const [allServices, setAllServices] = useState([]);
+  const [staff, setStaff] = useState([]);
+  const [holidays, setHolidays] = useState([]);
+  const [blockedSchedules, setBlockedSchedules] = useState({});
+
+  /*
+   * ============================================================
+   * FIRESTORE REAL-TIME DATA
+   * ============================================================
+   */
+
+  useEffect(() => {
+    const unsubscribeUsers = onSnapshot(
+      collection(db, "users"),
+      (snapshot) => {
+        const data = snapshot.docs.map((snapshotDoc) => ({
+          id: snapshotDoc.id,
+          ...snapshotDoc.data(),
+        }));
+
+        setUsers(data);
+      },
+      (error) => {
+        console.error("Error loading users:", error);
+        setUsers([]);
+      }
+    );
+
+    const unsubscribeMotorcycles = onSnapshot(
+      collection(db, "motorcycles"),
+      (snapshot) => {
+        const data = snapshot.docs.map((snapshotDoc) => ({
+          id: snapshotDoc.id,
+          ...snapshotDoc.data(),
+        }));
+
+        setMotorcycles(data);
+      },
+      (error) => {
+        console.error("Error loading motorcycles:", error);
+        setMotorcycles([]);
+      }
+    );
+
+    const unsubscribeServices = onSnapshot(
+      collection(db, "services"),
+      (snapshot) => {
+        const data = snapshot.docs.map((snapshotDoc) => ({
+          id: snapshotDoc.id,
+          ...snapshotDoc.data(),
+        }));
+
+        setAllServices(data);
+      },
+      (error) => {
+        console.error("Error loading services:", error);
+        setAllServices([]);
+      }
+    );
+
+    const unsubscribeStaff = onSnapshot(
+      collection(db, "staff"),
+      (snapshot) => {
+        const data = snapshot.docs.map((snapshotDoc) => ({
+          id: snapshotDoc.id,
+          ...snapshotDoc.data(),
+        }));
+
+        setStaff(data);
+      },
+      (error) => {
+        console.error("Error loading staff:", error);
+        setStaff([]);
+      }
+    );
+
+    const unsubscribeSchedules = onSnapshot(
+      collection(db, "schedules"),
+      (snapshot) => {
+        const bookedSlots = {};
+        const blockedSlots = {};
+
+        snapshot.docs.forEach((scheduleDoc) => {
+          const scheduleData = scheduleDoc.data();
+          const date =
+            scheduleData.date || scheduleDoc.id;
+
+          bookedSlots[date] =
+            scheduleData.bookedSlots || {};
+
+          if (
+            scheduleData.blockedSlots &&
+            Object.keys(scheduleData.blockedSlots).length > 0
+          ) {
+            blockedSlots[date] =
+              scheduleData.blockedSlots;
+          }
+        });
+
+        setShopSchedule({
+          dailyCapacity: DAILY_CAPACITY,
+          timeSlots: TIME_SLOTS,
+          bookedSlots,
+        });
+
+        setBlockedSchedules(blockedSlots);
+      },
+      (error) => {
+        console.error("Error loading schedules:", error);
+
+        setShopSchedule({
+          dailyCapacity: DAILY_CAPACITY,
+          timeSlots: TIME_SLOTS,
+          bookedSlots: {},
+        });
+
+        setBlockedSchedules({});
+      }
+    );
+
+    const unsubscribeHolidays = onSnapshot(
+      collection(db, "holidays"),
+      (snapshot) => {
+        const data = snapshot.docs.map((holidayDoc) => ({
+          id: holidayDoc.id,
+          ...holidayDoc.data(),
+        }));
+
+        setHolidays(data);
+      },
+      (error) => {
+        console.error("Error loading holidays:", error);
+        setHolidays([]);
+      }
+    );
+
+    return () => {
+      unsubscribeUsers();
+      unsubscribeMotorcycles();
+      unsubscribeServices();
+      unsubscribeStaff();
+      unsubscribeSchedules();
+      unsubscribeHolidays();
+    };
+  }, []);
+
+  /*
+   * ============================================================
+   * CUSTOMER DATA
+   * ============================================================
+   */
+
+  const allCustomers = users
+    .filter(
+      (user) =>
+        String(user.role || "").toLowerCase() ===
+        "customer"
+    )
+    .map((customer) => ({
+      ...customer,
+      name:
+        customer.fullName ||
+        customer.name ||
+        customer.email ||
+        "Customer",
+    }));
+
+  /*
+   * ============================================================
+   * STAFF DATA
+   * ============================================================
+   */
+
+  const mechanics = staff.map((staffMember) => ({
+    id: staffMember.id,
+
+    name:
+      staffMember.name ||
+      staffMember.fullName ||
+      staffMember.email ||
+      "Staff",
+
+    position:
+      staffMember.position ||
+      "Staff",
+
+    available:
+      String(
+        staffMember.status || "active"
+      ).toLowerCase() !== "inactive" &&
+      staffMember.available !== false,
+  }));
+
+  /*
+   * ============================================================
+   * STAFF AVAILABILITY FOR SELECTED DATE / TIME
+   * ============================================================
+   */
+
+  const availableMechanicsForAdd = mechanics.filter((mechanic) => {
+    if (!mechanic.available) {
+      return false;
     }
-    return mockCustomers;
-  })();
+
+    // Before a time is selected, show all active staff.
+    if (!addForm.date || !addForm.time) {
+      return true;
+    }
+
+    const hasConflict = allServices.some((service) => {
+      const status = String(service.status || "").toLowerCase().trim();
+      const approvalStatus = String(service.approvalStatus || "")
+        .toLowerCase()
+        .trim();
+
+      // Rejected services do not occupy a staff slot.
+      if (status === "rejected" || approvalStatus === "rejected") {
+        return false;
+      }
+
+      const serviceDate =
+        service.preferredDate ||
+        service.date ||
+        service.scheduleDate ||
+        service.requestDate ||
+        "";
+
+      const serviceTime =
+        service.preferredTime ||
+        service.time ||
+        service.scheduleTime ||
+        "";
+
+      if (serviceDate !== addForm.date || serviceTime !== addForm.time) {
+        return false;
+      }
+
+      return (
+        service.assignedStaffId === mechanic.id ||
+        service.assignedStaff === mechanic.name
+      );
+    });
+
+    return !hasConflict;
+  });
+
+  /*
+   * ============================================================
+   * DATA HELPERS
+   * ============================================================
+   */
+
+  const getCustomerById = (customerId) => {
+    if (!customerId) return null;
+
+    return users.find(
+      (user) => user.id === customerId
+    );
+  };
+
+  const getCustomerForRecord = (record) => {
+    const customerId =
+      record.customerId ||
+      record.userId ||
+      record.userUid ||
+      record.customerUid;
+
+    if (customerId) {
+      return getCustomerById(customerId);
+    }
+
+    if (record.customerEmail) {
+      return users.find(
+        (user) =>
+          String(user.email || "").toLowerCase() ===
+          String(record.customerEmail).toLowerCase()
+      );
+    }
+
+    if (record.userEmail) {
+      return users.find(
+        (user) =>
+          String(user.email || "").toLowerCase() ===
+          String(record.userEmail).toLowerCase()
+      );
+    }
+
+    return null;
+  };
+
+  const getMotorcycleForRecord = (record) => {
+    if (
+      record.motorcycle &&
+      typeof record.motorcycle === "object"
+    ) {
+      return record.motorcycle;
+    }
+
+    const motorcycleId =
+      record.motorcycleId;
+
+    if (motorcycleId) {
+      return motorcycles.find(
+        (motorcycle) =>
+          motorcycle.id === motorcycleId
+      );
+    }
+
+    return null;
+  };
+
+  const getMotorcycleOwnerId = (motorcycle) => {
+    return (
+      motorcycle.customerId ||
+      motorcycle.userId ||
+      motorcycle.ownerId ||
+      motorcycle.userUid ||
+      motorcycle.customerUid ||
+      ""
+    );
+  };
+
+  const formatMotorcycle = (motorcycle) => {
+    if (!motorcycle) return "";
+
+    if (typeof motorcycle === "string") {
+      return motorcycle;
+    }
+
+    const values = [
+      motorcycle.brand,
+      motorcycle.model,
+    ].filter(Boolean);
+
+    if (motorcycle.year) {
+      values.push(`(${motorcycle.year})`);
+    }
+
+    return values.join(" ");
+  };
+
+  const enrichAppointment = (service) => {
+    const customer =
+      getCustomerForRecord(service);
+
+    const motorcycle =
+      getMotorcycleForRecord(service);
+
+    return {
+      ...service,
+
+      customerName:
+        service.customerName ||
+        service.fullName ||
+        customer?.fullName ||
+        customer?.name ||
+        "Customer",
+
+      customerId:
+        service.customerId ||
+        service.userId ||
+        service.userUid ||
+        service.customerUid ||
+        customer?.id ||
+        "",
+
+      motorcycle:
+        service.motorcycleName ||
+        (typeof service.motorcycle === "string"
+          ? service.motorcycle
+          : formatMotorcycle(motorcycle)) ||
+        "",
+
+      serviceType:
+        service.serviceType ||
+        service.serviceName ||
+        service.type ||
+        "Service",
+
+      preferredDate:
+        service.preferredDate ||
+        service.date ||
+        service.scheduleDate ||
+        service.requestDate ||
+        "",
+
+      preferredTime:
+        service.preferredTime ||
+        service.time ||
+        service.scheduleTime ||
+        "",
+
+      status:
+        service.status ||
+        "Pending",
+
+      approvalStatus:
+        service.approvalStatus ||
+        "pending",
+
+      paymentStatus:
+        service.paymentStatus ||
+        "pending",
+    };
+  };
+
+  /*
+   * ============================================================
+   * CUSTOMER CHANGE
+   * ============================================================
+   */
 
   const handleCustomerChange = (customerId) => {
-    if (customerId === '__others__') {
+    if (customerId === "__others__") {
       setAddCustomerMotorcycles([]);
-      setAddForm(f => ({ ...f, customerId: '__others__', customerName: '', motorcycleId: '', motorcycle: '', otherBrand: '', otherModel: '', otherPlate: '', otherYear: '' }));
+
+      setAddForm((form) => ({
+        ...form,
+        customerId: "__others__",
+        customerName: "",
+        motorcycleId: "",
+        motorcycle: "",
+        otherBrand: "",
+        otherModel: "",
+        otherPlate: "",
+        otherYear: "",
+      }));
+
       return;
     }
-    const customer = allCustomers.find((c) => c.id === customerId);
+
+    const customer =
+      allCustomers.find(
+        (item) => item.id === customerId
+      );
+
     if (!customer) {
-      setAddForm(f => ({ ...f, customerId: '', customerName: '', motorcycleId: '', motorcycle: '' }));
+      setAddForm((form) => ({
+        ...form,
+        customerId: "",
+        customerName: "",
+        motorcycleId: "",
+        motorcycle: "",
+      }));
+
       setAddCustomerMotorcycles([]);
+
       return;
     }
-    const saved = localStorage.getItem(`umes_motorcycles_${customerId}`);
-    const motos = saved ? JSON.parse(saved) : (customer.motorcycles || []);
-    setAddCustomerMotorcycles(motos);
-    setAddForm(f => ({ ...f, customerId, customerName: customer.name, motorcycleId: '', motorcycle: '', otherBrand: '', otherModel: '', otherPlate: '', otherYear: '' }));
+
+    const customerMotorcycles =
+      motorcycles.filter((motorcycle) => {
+        const ownerId =
+          getMotorcycleOwnerId(motorcycle);
+
+        if (
+          ownerId &&
+          ownerId === customer.id
+        ) {
+          return true;
+        }
+
+        if (
+          motorcycle.customerEmail &&
+          customer.email
+        ) {
+          return (
+            String(
+              motorcycle.customerEmail
+            ).toLowerCase() ===
+            String(customer.email).toLowerCase()
+          );
+        }
+
+        if (
+          motorcycle.userEmail &&
+          customer.email
+        ) {
+          return (
+            String(
+              motorcycle.userEmail
+            ).toLowerCase() ===
+            String(customer.email).toLowerCase()
+          );
+        }
+
+        return false;
+      });
+
+    setAddCustomerMotorcycles(
+      customerMotorcycles
+    );
+
+    setAddForm((form) => ({
+      ...form,
+      customerId,
+      customerName:
+        customer.name ||
+        customer.fullName ||
+        customer.email ||
+        "",
+      motorcycleId: "",
+      motorcycle: "",
+      otherBrand: "",
+      otherModel: "",
+      otherPlate: "",
+      otherYear: "",
+    }));
   };
 
-  const handleCreateSchedule = () => {
-    const isOtherCustomer = addForm.customerId === '__others__';
-    const isOtherMoto = addForm.motorcycleId === '__others__';
+  /*
+   * ============================================================
+   * CREATE MANUAL SCHEDULE
+   * ============================================================
+   */
 
-    const resolvedCustomerName = isOtherCustomer ? addForm.customerName.trim() : addForm.customerName;
+  const handleCreateSchedule = async () => {
+    const isOtherCustomer =
+      addForm.customerId === "__others__";
+
+    const isOtherMoto =
+      addForm.motorcycleId === "__others__";
+
+    const resolvedCustomerName =
+      isOtherCustomer
+        ? addForm.customerName.trim()
+        : addForm.customerName;
+
     const resolvedMoto = isOtherMoto
-      ? [addForm.otherBrand, addForm.otherModel, addForm.otherYear ? `(${addForm.otherYear})` : ''].filter(Boolean).join(' ')
+      ? [
+          addForm.otherBrand,
+          addForm.otherModel,
+          addForm.otherYear
+            ? `(${addForm.otherYear})`
+            : "",
+        ]
+          .filter(Boolean)
+          .join(" ")
       : addForm.motorcycle;
 
-    if (!addForm.customerId || !resolvedCustomerName || !resolvedMoto || !addForm.serviceType || !addForm.date || !addForm.time) return;
+    if (
+      !addForm.customerId ||
+      !resolvedCustomerName ||
+      !resolvedMoto ||
+      !addForm.serviceType ||
+      !addForm.date ||
+      !addForm.time ||
+      !addForm.assignedStaff
+    ) {
+      return;
+    }
 
-    const newEntry = {
-      id: `manual-${Date.now()}`,
-      customerId: isOtherCustomer ? `other-${Date.now()}` : addForm.customerId,
-      customerName: resolvedCustomerName,
-      motorcycleId: isOtherMoto ? '' : addForm.motorcycleId,
-      motorcycle: resolvedMoto,
-      plate: isOtherMoto ? addForm.otherPlate.trim() : '',
-      serviceType: addForm.serviceType,
-      preferredDate: addForm.date,
-      preferredTime: addForm.time,
-      requestDate: todayStr,
-      assignedStaff: addForm.assignedStaff,
-      issueDescription: addForm.notes,
-      approvalStatus: 'approved',
-      paymentStatus: 'confirmed',
-      status: 'pending'
-    };
+    try {
+      const selectedStaff =
+        mechanics.find(
+          (staffMember) =>
+            staffMember.id === addForm.assignedStaffId ||
+            staffMember.name === addForm.assignedStaff
+        );
 
-    const existing = JSON.parse(localStorage.getItem('umes_service_requests') || '[]');
-    localStorage.setItem('umes_service_requests', JSON.stringify([...existing, newEntry]));
+      if (!selectedStaff) {
+        return;
+      }
 
-    const updatedSchedule = { ...shopSchedule };
-    if (!updatedSchedule.bookedSlots[addForm.date]) updatedSchedule.bookedSlots[addForm.date] = {};
-    updatedSchedule.bookedSlots[addForm.date][addForm.time] =
-      (updatedSchedule.bookedSlots[addForm.date][addForm.time] || 0) + 1;
-    setShopSchedule(updatedSchedule);
-    localStorage.setItem('umes_shop_schedule', JSON.stringify(updatedSchedule));
+      const serviceRef = doc(
+        collection(db, "services")
+      );
 
-    if (addForm.date !== selectedDate) setSelectedDate(addForm.date);
+      const generatedCustomerId =
+        isOtherCustomer
+          ? `manual-customer-${serviceRef.id}`
+          : addForm.customerId;
 
-    setShowAddModal(false);
-    setAddForm({ customerId: '', customerName: '', motorcycleId: '', motorcycle: '', serviceType: '', date: todayStr, time: '', assignedStaff: '', notes: '', otherBrand: '', otherModel: '', otherPlate: '', otherYear: '' });
-    setAddCustomerMotorcycles([]);
+      const scheduleRef = doc(
+        db,
+        "schedules",
+        addForm.date
+      );
+
+      await runTransaction(
+        db,
+        async (transaction) => {
+          const scheduleSnapshot =
+            await transaction.get(
+              scheduleRef
+            );
+
+          const scheduleData =
+            scheduleSnapshot.exists()
+              ? scheduleSnapshot.data()
+              : {};
+
+          const existingBookedSlots =
+            scheduleData.bookedSlots || {};
+
+          const currentCount =
+            Number(
+              existingBookedSlots[
+                addForm.time
+              ] || 0
+            );
+
+          const newEntry = {
+            customerId:
+              generatedCustomerId,
+
+            customerName:
+              resolvedCustomerName,
+
+            motorcycleId:
+              isOtherMoto
+                ? ""
+                : addForm.motorcycleId,
+
+            motorcycle:
+              resolvedMoto,
+
+            plate:
+              isOtherMoto
+                ? addForm.otherPlate.trim()
+                : "",
+
+            serviceType:
+              addForm.serviceType,
+
+            preferredDate:
+              addForm.date,
+
+            preferredTime:
+              addForm.time,
+
+            requestDate:
+              todayStr,
+
+            assignedStaff:
+              addForm.assignedStaff,
+
+            assignedStaffId:
+              selectedStaff?.id || null,
+
+            assignedStaffPosition:
+              selectedStaff?.position || null,
+
+            issueDescription:
+              addForm.notes,
+
+            approvalStatus:
+              "approved",
+
+            paymentStatus:
+              "confirmed",
+
+            status:
+              "Pending",
+
+            createdAt:
+              serverTimestamp(),
+
+            updatedAt:
+              serverTimestamp(),
+          };
+
+          transaction.set(
+            serviceRef,
+            newEntry
+          );
+
+          transaction.set(
+            scheduleRef,
+            {
+              date: addForm.date,
+
+              bookedSlots: {
+                ...existingBookedSlots,
+
+                [addForm.time]:
+                  currentCount + 1,
+              },
+
+              updatedAt:
+                serverTimestamp(),
+            },
+            {
+              merge: true,
+            }
+          );
+        }
+      );
+
+      if (
+        addForm.date !== selectedDate
+      ) {
+        setSelectedDate(
+          addForm.date
+        );
+
+        setCurrentMonth(
+          new Date(
+            `${addForm.date}T00:00:00`
+          )
+        );
+      }
+
+      setShowAddModal(false);
+
+      setAddForm({
+        customerId: "",
+        customerName: "",
+        motorcycleId: "",
+        motorcycle: "",
+        serviceType: "",
+        date: todayStr,
+        time: "",
+        assignedStaff: "",
+        assignedStaffId: "",
+        notes: "",
+        otherBrand: "",
+        otherModel: "",
+        otherPlate: "",
+        otherYear: "",
+      });
+
+      setAddCustomerMotorcycles([]);
+    } catch (error) {
+      console.error(
+        "Error creating schedule:",
+        error
+      );
+    }
   };
 
-  const [mechanics, setMechanics] = useState(() => {
-    const saved = localStorage.getItem('umes_mechanics');
-    if (saved) return JSON.parse(saved);
-    return [
-      { id: 'mech-1', name: 'Juan Dela Cruz', maxAppointments: 5, available: true },
-      { id: 'mech-2', name: 'Maria Santos', maxAppointments: 5, available: true },
-      { id: 'mech-3', name: 'Pedro Garcia', maxAppointments: 4, available: true }
-    ];
-  });
+  /*
+   * ============================================================
+   * CALENDAR HELPERS
+   * ============================================================
+   */
 
-  const [holidays, setHolidays] = useState(() => {
-    const saved = localStorage.getItem('umes_holidays');
-    if (saved) return JSON.parse(saved);
-    return [];
-  });
-
-  const [blockedSchedules, setBlockedSchedules] = useState(() => {
-    const saved = localStorage.getItem('umes_blocked_schedules');
-    if (saved) return JSON.parse(saved);
-    return {};
-  });
-
-  // ── Calendar helpers ───────────────────────────────────────────────
   const getDaysInMonth = (date) => {
-    const year = date.getFullYear();
-    const month = date.getMonth();
-    const firstDay = new Date(year, month, 1);
-    const lastDay = new Date(year, month + 1, 0);
-    const daysInMonth = lastDay.getDate();
-    const startingDayOfWeek = firstDay.getDay();
+    const year =
+      date.getFullYear();
+
+    const month =
+      date.getMonth();
+
+    const firstDay =
+      new Date(
+        year,
+        month,
+        1
+      );
+
+    const lastDay =
+      new Date(
+        year,
+        month + 1,
+        0
+      );
+
+    const daysInMonth =
+      lastDay.getDate();
+
+    const startingDayOfWeek =
+      firstDay.getDay();
+
     const days = [];
-    for (let i = 0; i < startingDayOfWeek; i++) days.push(null);
-    for (let day = 1; day <= daysInMonth; day++) days.push(day);
+
+    for (
+      let i = 0;
+      i < startingDayOfWeek;
+      i++
+    ) {
+      days.push(null);
+    }
+
+    for (
+      let day = 1;
+      day <= daysInMonth;
+      day++
+    ) {
+      days.push(day);
+    }
+
     return days;
   };
 
   const formatDate = (day) => {
-    const year = currentMonth.getFullYear();
-    const month = String(currentMonth.getMonth() + 1).padStart(2, '0');
-    const dayStr = String(day).padStart(2, '0');
+    const year =
+      currentMonth.getFullYear();
+
+    const month =
+      String(
+        currentMonth.getMonth() + 1
+      ).padStart(2, "0");
+
+    const dayStr =
+      String(day).padStart(2, "0");
+
     return `${year}-${month}-${dayStr}`;
   };
 
   const getDateStatus = (dateStr) => {
-    const bookedSlots = shopSchedule.bookedSlots[dateStr] || {};
+    const bookedSlots =
+      shopSchedule.bookedSlots[
+        dateStr
+      ] || {};
+
     let occupiedSlotCount = 0;
-    shopSchedule.timeSlots.forEach((time) => {
-      if ((bookedSlots[time] || 0) > 0) occupiedSlotCount++;
-    });
-    const totalSlots = shopSchedule.timeSlots.length;
-    const isFullyBooked = occupiedSlotCount >= totalSlots;
-    const isPartial = occupiedSlotCount > 0 && !isFullyBooked;
-    return { isFullyBooked, isPartial, occupiedSlotCount, totalSlots };
+
+    shopSchedule.timeSlots.forEach(
+      (time) => {
+        if (
+          (bookedSlots[time] || 0) > 0
+        ) {
+          occupiedSlotCount++;
+        }
+      }
+    );
+
+    const totalSlots =
+      shopSchedule.timeSlots.length;
+
+    const isFullyBooked =
+      occupiedSlotCount >=
+      totalSlots;
+
+    const isPartial =
+      occupiedSlotCount > 0 &&
+      !isFullyBooked;
+
+    return {
+      isFullyBooked,
+      isPartial,
+      occupiedSlotCount,
+      totalSlots,
+    };
   };
 
   const getOccupiedSlots = (dateStr) => {
-    const bookedSlots = shopSchedule.bookedSlots[dateStr] || {};
-    return shopSchedule.timeSlots.filter((t) => (bookedSlots[t] || 0) > 0).length;
+    const bookedSlots =
+      shopSchedule.bookedSlots[
+        dateStr
+      ] || {};
+
+    return shopSchedule.timeSlots.filter(
+      (time) =>
+        (bookedSlots[time] || 0) > 0
+    ).length;
   };
 
   const isToday = (day) => {
-    const today = new Date();
+    const today =
+      new Date();
+
     return (
       day === today.getDate() &&
-      currentMonth.getMonth() === today.getMonth() &&
-      currentMonth.getFullYear() === today.getFullYear()
+      currentMonth.getMonth() ===
+        today.getMonth() &&
+      currentMonth.getFullYear() ===
+        today.getFullYear()
     );
   };
 
-  const isHoliday = (dateStr) => holidays.some((h) => h.date === dateStr);
-  const isDateBlocked = (dateStr) => Object.keys(blockedSchedules[dateStr] || {}).length > 0;
+  const isHoliday = (dateStr) =>
+    holidays.some(
+      (holiday) =>
+        holiday.date === dateStr
+    );
 
-  const getAppointmentsForDate = (dateStr) => {
-    const requests = JSON.parse(localStorage.getItem('umes_service_requests') || '[]');
-    const activeServices = JSON.parse(localStorage.getItem('umes_active_services') || '[]');
-    const dateReqs = requests.filter((r) => r.preferredDate === dateStr);
-    const dateActive = activeServices.filter((s) => s.requestDate === dateStr);
-    return [...dateReqs, ...dateActive];
+  const isDateBlocked = (dateStr) =>
+    Object.keys(
+      blockedSchedules[dateStr] || {}
+    ).length > 0;
+
+  /*
+   * ============================================================
+   * APPOINTMENTS
+   * ============================================================
+   */
+
+  const getAppointmentsForDate = (
+    dateStr
+  ) => {
+    return allServices
+      .map(enrichAppointment)
+      .filter(
+        (service) =>
+          service.preferredDate ===
+          dateStr &&
+          service.status !==
+            "Rejected" &&
+          String(
+            service.approvalStatus || ""
+          ).toLowerCase() !==
+            "rejected"
+      );
   };
 
-  // ── Block Schedule ────────────────────────────────────────────────
-  const handleBlockSchedule = () => {
-    if (!selectedDate || !blockForm.timeSlot) return;
-    const updatedBlocked = { ...blockedSchedules };
-    if (!updatedBlocked[selectedDate]) updatedBlocked[selectedDate] = {};
-    updatedBlocked[selectedDate][blockForm.timeSlot] = {
-      reason: blockForm.reason,
-      blockedAt: new Date().toISOString()
+  /*
+   * ============================================================
+   * BLOCK SCHEDULE
+   * ============================================================
+   */
+
+  const handleBlockSchedule =
+    async () => {
+      if (
+        !selectedDate ||
+        !blockForm.timeSlot
+      ) {
+        return;
+      }
+
+      try {
+        const scheduleRef =
+          doc(
+            db,
+            "schedules",
+            selectedDate
+          );
+
+        await runTransaction(
+          db,
+          async (transaction) => {
+            const scheduleSnapshot =
+              await transaction.get(
+                scheduleRef
+              );
+
+            const scheduleData =
+              scheduleSnapshot.exists()
+                ? scheduleSnapshot.data()
+                : {};
+
+            const existingBookedSlots =
+              scheduleData.bookedSlots ||
+              {};
+
+            const existingBlockedSlots =
+              scheduleData.blockedSlots ||
+              {};
+
+            transaction.set(
+              scheduleRef,
+              {
+                date: selectedDate,
+
+                bookedSlots: {
+                  ...existingBookedSlots,
+
+                  [blockForm.timeSlot]:
+                    DAILY_CAPACITY,
+                },
+
+                blockedSlots: {
+                  ...existingBlockedSlots,
+
+                  [blockForm.timeSlot]: {
+                    reason:
+                      blockForm.reason.trim() ||
+                      "Blocked",
+                    blockedAt:
+                      new Date().toISOString(),
+                  },
+                },
+
+                updatedAt:
+                  serverTimestamp(),
+              },
+              {
+                merge: true,
+              }
+            );
+          }
+        );
+
+        setShowBlockModal(false);
+
+        setBlockForm({
+          timeSlot: "",
+          reason: "",
+        });
+      } catch (error) {
+        console.error(
+          "Error blocking schedule:",
+          error
+        );
+      }
     };
-    setBlockedSchedules(updatedBlocked);
-    localStorage.setItem('umes_blocked_schedules', JSON.stringify(updatedBlocked));
 
-    const updatedSchedule = { ...shopSchedule };
-    if (!updatedSchedule.bookedSlots[selectedDate]) updatedSchedule.bookedSlots[selectedDate] = {};
-    updatedSchedule.bookedSlots[selectedDate][blockForm.timeSlot] = shopSchedule.dailyCapacity;
-    setShopSchedule(updatedSchedule);
-    localStorage.setItem('umes_shop_schedule', JSON.stringify(updatedSchedule));
-    setShowBlockModal(false);
-    setBlockForm({ timeSlot: '', reason: '' });
-  };
+  /*
+   * ============================================================
+   * DERIVED DATA
+   * ============================================================
+   */
 
-  // ── Derived data ───────────────────────────────────────────────────
-  const selectedAppointments = getAppointmentsForDate(selectedDate);
-  const occupiedToday = getOccupiedSlots(todayStr);
-  const occupiedSelected = getOccupiedSlots(selectedDate);
-  const totalSlots = shopSchedule.timeSlots.length;
-  const availableToday = totalSlots - occupiedToday;
-  const blockedHoursToday = Object.keys(blockedSchedules[todayStr] || {}).length;
-  const availableMechanics = mechanics.filter((m) => m.available).length;
-  const capacityPct = totalSlots > 0 ? (occupiedSelected / totalSlots) * 100 : 0;
+  const selectedAppointments =
+    getAppointmentsForDate(
+      selectedDate
+    );
 
-  const formatDisplayDate = (dateStr) => {
-    const d = new Date(dateStr + 'T00:00:00');
-    return d.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
-  };
+  const occupiedToday =
+    getOccupiedSlots(
+      todayStr
+    );
+
+  const occupiedSelected =
+    getOccupiedSlots(
+      selectedDate
+    );
+
+  const totalSlots =
+    shopSchedule.timeSlots.length;
+
+  const availableToday =
+    totalSlots -
+    occupiedToday;
+
+  const blockedHoursToday =
+    Object.keys(
+      blockedSchedules[
+        todayStr
+      ] || {}
+    ).length;
+
+  const availableMechanics =
+    mechanics.filter(
+      (mechanic) =>
+        mechanic.available
+    ).length;
+
+  const capacityPct =
+    totalSlots > 0
+      ? (occupiedSelected /
+          totalSlots) *
+        100
+      : 0;
+
+  const formatDisplayDate =
+    (dateStr) => {
+      const date =
+        new Date(
+          dateStr +
+            "T00:00:00"
+        );
+
+      return date.toLocaleDateString(
+        "en-US",
+        {
+          weekday: "long",
+          month: "long",
+          day: "numeric",
+          year: "numeric",
+        }
+      );
+    };
 
   const statusLabel = (appt) => {
-    if (appt.status === 'In Progress') return 'In Progress';
-    if (appt.status === 'Completed') return 'Completed';
-    if (appt.approvalStatus === 'approved' && appt.paymentStatus === 'confirmed') return 'Confirmed';
-    if (appt.approvalStatus === 'approved') return 'Approved';
-    return 'Pending';
+    if (
+      appt.status ===
+      "In Progress"
+    ) {
+      return "In Progress";
+    }
+
+    if (
+      appt.status ===
+      "Completed"
+    ) {
+      return "Completed";
+    }
+
+    if (
+      appt.approvalStatus ===
+        "approved" &&
+      appt.paymentStatus ===
+        "confirmed"
+    ) {
+      return "Confirmed";
+    }
+
+    if (
+      appt.approvalStatus ===
+      "approved"
+    ) {
+      return "Approved";
+    }
+
+    return "Pending";
   };
 
-  const statusBadgeClass = (label) => {
-    if (label === 'Confirmed' || label === 'In Progress') return 'bg-gray-900 text-white';
-    if (label === 'Approved') return 'bg-gray-700 text-white';
-    if (label === 'Completed') return 'bg-gray-100 text-gray-500';
-    return 'bg-gray-100 text-gray-600';
-  };
+  const statusBadgeClass =
+    (label) => {
+      if (
+        label === "Confirmed" ||
+        label === "In Progress"
+      ) {
+        return "bg-gray-900 text-white";
+      }
 
-  const getApptTime = (appt) => appt.preferredTime || '—';
+      if (
+        label === "Approved"
+      ) {
+        return "bg-gray-700 text-white";
+      }
 
+      if (
+        label === "Completed"
+      ) {
+        return "bg-gray-100 text-gray-500";
+      }
+
+      return "bg-gray-100 text-gray-600";
+    };
+
+  const getApptTime = (appt) =>
+    appt.preferredTime ||
+    "—";
   return (
     <AdminLayout title="Schedules">
 
@@ -419,28 +1375,140 @@ function AdminSchedule() {
               <Users size={11} />
               Assigned Mechanics
             </p>
+
             <div className="space-y-1.5">
-              {mechanics.map((mechanic, idx) => {
-                const busy = mechanic.available && idx < occupiedSelected;
-                const mechanicStatus = !mechanic.available ? 'Unavailable' : busy ? 'Busy' : 'Available';
-                return (
-                  <div key={mechanic.id} className="flex items-center justify-between py-2 px-3 rounded-lg bg-gray-50">
-                    <div className="flex items-center gap-2.5">
-                      <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-                        mechanicStatus === 'Available' ? 'bg-green-500' :
-                        mechanicStatus === 'Busy' ? 'bg-amber-400' : 'bg-gray-300'
-                      }`} />
-                      <span className="text-sm text-gray-800">{mechanic.name}</span>
+              {mechanics.length === 0 ? (
+                <div className="py-3 px-3 rounded-lg bg-gray-50">
+                  <p className="text-xs text-gray-400">
+                    No staff members registered.
+                  </p>
+                </div>
+              ) : (
+                mechanics.map((mechanic) => {
+                  /*
+                   * Get appointments assigned to this mechanic
+                   * for the currently selected date.
+                   */
+                  const mechanicAppointments =
+                    selectedAppointments.filter(
+                      (appointment) =>
+                        appointment.assignedStaffId === mechanic.id ||
+                        appointment.assignedStaff === mechanic.name
+                    );
+
+                  /*
+                   * Count unique appointment times so one mechanic
+                   * slot is counted once per time slot.
+                   */
+                  const occupiedMechanicTimes = [
+                    ...new Set(
+                      mechanicAppointments
+                        .map(
+                          (appointment) =>
+                            appointment.preferredTime
+                        )
+                        .filter(Boolean)
+                    ),
+                  ];
+
+                  /*
+                   * Count blocked time slots for the selected date.
+                   */
+                  const blockedTimes = Object.keys(
+                    blockedSchedules[selectedDate] || {}
+                  );
+
+                  /*
+                   * Total time slots available to this mechanic
+                   * on the selected date.
+                   */
+                  const totalAvailableTimeSlots =
+                    shopSchedule.timeSlots.filter(
+                      (time) => !blockedTimes.includes(time)
+                    ).length;
+
+                  /*
+                   * Remaining appointment slots for this mechanic.
+                   */
+                  const availableMechanicSlots =
+                    mechanic.available
+                      ? Math.max(
+                          totalAvailableTimeSlots -
+                            occupiedMechanicTimes.length,
+                          0
+                        )
+                      : 0;
+
+                  const mechanicStatus =
+                    !mechanic.available
+                      ? "Unavailable"
+                      : availableMechanicSlots === 0
+                      ? "Fully Booked"
+                      : occupiedMechanicTimes.length > 0
+                      ? "Partially Booked"
+                      : "Available";
+
+                  return (
+                    <div
+                      key={mechanic.id}
+                      className="flex items-center justify-between py-2.5 px-3 rounded-lg bg-gray-50"
+                    >
+                      <div className="flex items-center gap-2.5 min-w-0">
+                        <div
+                          className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                            mechanicStatus === "Available"
+                              ? "bg-green-500"
+                              : mechanicStatus === "Partially Booked"
+                              ? "bg-amber-400"
+                              : mechanicStatus === "Fully Booked"
+                              ? "bg-gray-700"
+                              : "bg-gray-300"
+                          }`}
+                        />
+
+                        <div className="min-w-0">
+                          <p className="text-sm text-gray-800 truncate">
+                            {mechanic.name}
+                          </p>
+
+                          <p className="text-[10px] text-gray-400">
+                            {mechanicAppointments.length}{" "}
+                            {mechanicAppointments.length === 1
+                              ? "appointment"
+                              : "appointments"}{" "}
+                            assigned
+                          </p>
+                        </div>
+                      </div>
+
+                      <div className="text-right shrink-0 ml-3">
+                        <p
+                          className={`text-xs font-semibold ${
+                            mechanicStatus === "Available"
+                              ? "text-green-600"
+                              : mechanicStatus === "Partially Booked"
+                              ? "text-amber-600"
+                              : mechanicStatus === "Fully Booked"
+                              ? "text-gray-700"
+                              : "text-gray-400"
+                          }`}
+                        >
+                          {availableMechanicSlots}{" "}
+                          {availableMechanicSlots === 1
+                            ? "slot"
+                            : "slots"}{" "}
+                          available
+                        </p>
+
+                        <p className="text-[10px] text-gray-400">
+                          {occupiedMechanicTimes.length}/
+                          {totalAvailableTimeSlots} booked
+                        </p>
+                      </div>
                     </div>
-                    <span className={`text-[11px] font-medium ${
-                      mechanicStatus === 'Available' ? 'text-green-600' :
-                      mechanicStatus === 'Busy' ? 'text-amber-600' : 'text-gray-400'
-                    }`}>
-                      {mechanicStatus}
-                    </span>
-                  </div>
-                );
-              })}
+                  );
+                })
+              )}
             </div>
           </div>
 
@@ -693,7 +1761,14 @@ function AdminSchedule() {
                   <input
                     type="date"
                     value={addForm.date}
-                    onChange={(e) => setAddForm(f => ({ ...f, date: e.target.value }))}
+                    onChange={(e) =>
+                      setAddForm((f) => ({
+                        ...f,
+                        date: e.target.value,
+                        assignedStaff: "",
+                        assignedStaffId: "",
+                      }))
+                    }
                     className="w-full px-3 py-2.5 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-gray-400 text-sm"
                   />
                 </div>
@@ -701,7 +1776,14 @@ function AdminSchedule() {
                   <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wider mb-1.5">Time *</label>
                   <select
                     value={addForm.time}
-                    onChange={(e) => setAddForm(f => ({ ...f, time: e.target.value }))}
+                    onChange={(e) =>
+                      setAddForm((f) => ({
+                        ...f,
+                        time: e.target.value,
+                        assignedStaff: "",
+                        assignedStaffId: "",
+                      }))
+                    }
                     className="w-full px-3 py-2.5 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-gray-400 text-sm bg-white"
                   >
                     <option value="">Select time</option>
@@ -717,16 +1799,39 @@ function AdminSchedule() {
                 <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wider mb-1.5">Assigned Staff</label>
                 <select
                   value={addForm.assignedStaff}
-                  onChange={(e) => setAddForm(f => ({ ...f, assignedStaff: e.target.value }))}
+                  onChange={(e) => {
+                    const selectedName = e.target.value;
+                    const selectedStaff = availableMechanicsForAdd.find(
+                      (m) => m.name === selectedName
+                    );
+
+                    setAddForm((f) => ({
+                      ...f,
+                      assignedStaff: selectedName,
+                      assignedStaffId: selectedStaff?.id || "",
+                    }));
+                  }}
                   className="w-full px-3 py-2.5 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-gray-400 text-sm bg-white"
                 >
-                  <option value="">Select staff member</option>
-                  {mechanics.map((m) => (
+                  <option value="">
+                    {addForm.time
+                      ? "Select available staff"
+                      : "Select time first"}
+                  </option>
+
+                  {availableMechanicsForAdd.map((m) => (
                     <option key={m.id} value={m.name}>
-                      {m.name} — {m.available ? 'Available' : 'Unavailable'}
+                      {m.name} — Available
                     </option>
                   ))}
                 </select>
+
+                {addForm.time &&
+                  availableMechanicsForAdd.length === 0 && (
+                    <p className="text-xs text-red-500 mt-2">
+                      No staff available for {addForm.time} on {addForm.date}.
+                    </p>
+                  )}
               </div>
 
               {/* Notes */}
@@ -750,7 +1855,7 @@ function AdminSchedule() {
                   (addForm.customerId === '__others__' && !addForm.customerName.trim()) ||
                   !addForm.motorcycleId ||
                   (addForm.motorcycleId === '__others__' ? !addForm.otherBrand.trim() : !addForm.motorcycle) ||
-                  !addForm.serviceType || !addForm.date || !addForm.time
+                  !addForm.serviceType || !addForm.date || !addForm.time || !addForm.assignedStaff
                 }
                 className="flex-1 bg-[#0a0f1a] text-white py-2.5 rounded-lg hover:bg-[#1e293b] text-sm font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
               >

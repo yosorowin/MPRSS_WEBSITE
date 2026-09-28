@@ -2,6 +2,8 @@ import { useState } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import { Eye, EyeOff, Shield, Lock, Wrench, Users, Package, Calendar } from 'lucide-react';
 import logo from "../assets/logo.png";
+import { signInWithEmailAndPassword } from 'firebase/auth';
+import { auth } from "../firebase";
 
 function AdminLogin() {
   const navigate = useNavigate();
@@ -10,20 +12,22 @@ function AdminLogin() {
   const [error, setError] = useState('');
   const [showPassword, setShowPassword] = useState(false);
 
-  const handleLogin = (e) => {
-    e.preventDefault();
-    setError('');
+  const handleLogin = async (e) => {
+  e.preventDefault();
+  setError('');
 
-    if (email === 'admin@mprss.com' && password === 'admin123') {
-      localStorage.setItem('userRole', 'admin');
-      localStorage.setItem('userId', 'admin-1');
-      localStorage.setItem('userName', 'Admin User');
-      navigate('/admin/dashboard');
-      return;
-    }
+  try {
+    await signInWithEmailAndPassword(auth, email, password);
 
-    setError('Invalid admin credentials. Access denied.');
-  };
+    localStorage.setItem('userRole', 'admin');
+    localStorage.setItem('userId', email);
+    localStorage.setItem('userName', 'Admin User');
+
+    navigate('/admin/dashboard');
+  } catch {
+    setError('Invalid email or password. Access denied.');
+  }
+};
 
   return (
     <div className="min-h-screen flex bg-white" style={{ fontFamily: "'DM Sans', sans-serif" }}>
