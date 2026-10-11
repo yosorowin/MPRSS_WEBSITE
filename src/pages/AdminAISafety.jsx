@@ -98,6 +98,41 @@ export default function AdminAISafety() {
             }
           : {}),
       });
+
+      // If the admin resolves an alert that already has a suggestion but
+      // has not delivered it yet, send that suggestion to the build owner.
+      if (
+        newStatus === "Resolved" &&
+        alert.adminMessage?.trim() &&
+        alert.adminNotified !== true
+      ) {
+        const customerId =
+          alert.customerId ||
+          alert.userId ||
+          alert.userUid ||
+          alert.customerUid ||
+          "";
+
+        if (customerId) {
+          await addDoc(collection(db, "notifications"), {
+            customerId,
+            recipientRole: "customer",
+            type: "ai_safety_resolved",
+            title: "AI Safety Alert Resolved",
+            message: alert.adminMessage.trim(),
+            route: "/ai-assistant",
+            alertId: alert.id,
+            riskLevel: alert.riskLevel || "",
+            read: false,
+            createdAt: serverTimestamp(),
+          });
+
+          await updateDoc(alertRef, {
+            adminNotified: true,
+            notifiedAt: serverTimestamp(),
+          });
+        }
+      }
     } catch (error) {
       console.error(
         "Error updating AI alert status:",
@@ -158,10 +193,16 @@ export default function AdminAISafety() {
         selectedAlert.customerUid ||
         "";
 
+      if (!customerId) {
+        throw new Error("This AI alert has no customer UID, so the recommendation cannot be delivered.");
+      }
+
       await addDoc(
         collection(db, "notifications"),
         {
           customerId,
+          recipientRole: "customer",
+          route: "/ai-assistant",
 
           customerName:
             selectedAlert.customerName ||

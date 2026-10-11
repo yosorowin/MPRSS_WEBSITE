@@ -3,9 +3,10 @@ import AdminLayout from "./AdminLayout";
 import { Send, ArrowLeft } from "lucide-react";
 
 import {
-  arrayUnion,
+  addDoc,
   collection,
   doc,
+  increment,
   onSnapshot,
   serverTimestamp,
   updateDoc,
@@ -16,27 +17,56 @@ import { db } from "../firebase";
 export default function AdminMessages() {
   const [chats, setChats] = useState([]);
   const [selectedChatId, setSelectedChatId] = useState(null);
+  const [selectedMessages, setSelectedMessages] = useState([]);
   const [messageText, setMessageText] = useState("");
 
   const [loading, setLoading] = useState(true);
+  const [messagesLoading, setMessagesLoading] = useState(false);
   const [firestoreError, setFirestoreError] = useState("");
 
   /*
    * ============================================================
-   * FIRESTORE REAL-TIME MESSAGES
+   * FIRESTORE REAL-TIME CONVERSATIONS
+   *
+   * Conversation structure:
+   *
+   * conversations/{conversationId}
+   *   customerId
+   *   customerUid
+   *   customerName
+   *   customerEmail
+   *   recipientRole: "admin"
+   *   unreadForCustomer
+   *   unreadForRecipient
+   *   lastMessage
+   *   lastMessageAt
+   *   updatedAt
+   *
+   * conversations/{conversationId}/messages/{messageId}
+   *   senderId
+   *   senderRole
+   *   senderName
+   *   message
+   *   createdAt
    * ============================================================
    */
 
   useEffect(() => {
-    const unsubscribeMessages = onSnapshot(
-      collection(db, "messages"),
+    const unsubscribe = onSnapshot(
+      collection(db, "conversations"),
       (snapshot) => {
-        const data = snapshot.docs.map((messageDoc) => ({
-          id: messageDoc.id,
-          ...messageDoc.data(),
-        }));
+        const data = snapshot.docs
+          .map((conversationDoc) => ({
+            id: conversationDoc.id,
+            ...conversationDoc.data(),
+          }))
+          .filter(
+            (conversation) =>
+              (conversation.recipientId === "admin" ||
+              conversation.recipientRole === "admin" ||
+              (!conversation.recipientId && !conversation.recipientRole))
+          );
 
-        // Sort conversations by latest update
         data.sort((a, b) => {
           const getTime = (value) => {
             if (!value) return 0;
@@ -45,8 +75,18 @@ export default function AdminMessages() {
               return value.toMillis();
             }
 
+            if (typeof value.toDate === "function") {
+              return value.toDate().getTime();
+            }
+
             if (value instanceof Date) {
               return value.getTime();
+            }
+
+            if (
+              typeof value.seconds === "number"
+            ) {
+              return value.seconds * 1000;
             }
 
             const parsed = new Date(value).getTime();
@@ -55,8 +95,8 @@ export default function AdminMessages() {
           };
 
           return (
-            getTime(b.updatedAt) -
-            getTime(a.updatedAt)
+            getTime(b.lastMessageAt || b.updatedAt) -
+            getTime(a.lastMessageAt || a.updatedAt)
           );
         });
 
@@ -66,7 +106,7 @@ export default function AdminMessages() {
       },
       (error) => {
         console.error(
-          "MESSAGES FIRESTORE ERROR:",
+          "CONVERSATIONS FIRESTORE ERROR:",
           error
         );
 
@@ -76,8 +116,83 @@ export default function AdminMessages() {
       }
     );
 
-    return () => unsubscribeMessages();
+    return () => unsubscribe();
   }, []);
+
+  /*
+   * ============================================================
+   * REAL-TIME MESSAGES FOR SELECTED CONVERSATION
+   * ============================================================
+   */
+
+  useEffect(() => {
+    if (!selectedChatId) {
+      setSelectedMessages([]);
+      setMessagesLoading(false);
+      return;
+    }
+
+    setMessagesLoading(true);
+
+    const messagesRef = collection(
+      db,
+      "conversations",
+      selectedChatId,
+      "messages"
+    );
+
+    const unsubscribe = onSnapshot(
+      messagesRef,
+      (snapshot) => {
+        const data = snapshot.docs.map((messageDoc) => ({
+          id: messageDoc.id,
+          ...messageDoc.data(),
+        }));
+
+        data.sort((a, b) => {
+          const getTime = (value) => {
+            if (!value) return 0;
+
+            if (typeof value.toMillis === "function") {
+              return value.toMillis();
+            }
+
+            if (typeof value.toDate === "function") {
+              return value.toDate().getTime();
+            }
+
+            if (typeof value.seconds === "number") {
+              return value.seconds * 1000;
+            }
+
+            const parsed = new Date(value).getTime();
+
+            return Number.isNaN(parsed) ? 0 : parsed;
+          };
+
+          return (
+            getTime(a.createdAt) -
+            getTime(b.createdAt)
+          );
+        });
+
+        setSelectedMessages(data);
+        setMessagesLoading(false);
+      },
+      (error) => {
+        console.error(
+          "CONVERSATION MESSAGES FIRESTORE ERROR:",
+          error
+        );
+
+        setSelectedMessages([]);
+        setMessagesLoading(false);
+        setFirestoreError(error.message);
+      }
+    );
+
+    return () => unsubscribe();
+  }, [selectedChatId]);
 
   /*
    * ============================================================
@@ -107,17 +222,20 @@ export default function AdminMessages() {
       return;
     }
 
-    // Reset unread count in Firestore
-    if (Number(chat.unread || 0) > 0) {
+    /*
+     * Admin has opened the conversation,
+     * so clear the unread count for admin.
+     */
+    if (Number(chat.unreadForRecipient || 0) > 0) {
       try {
         const chatRef = doc(
           db,
-          "messages",
+          "conversations",
           chatId
         );
 
         await updateDoc(chatRef, {
-          unread: 0,
+          unreadForRecipient: 0,
           updatedAt: serverTimestamp(),
         });
       } catch (error) {
@@ -143,39 +261,72 @@ export default function AdminMessages() {
       return;
     }
 
-    const trimmedMessage =
-      messageText.trim();
+    const trimmedMessage = messageText.trim();
+    const conversationRef = doc(
+      db,
+      "conversations",
+      selectedChat.id
+    );
 
-    const newMessage = {
-      sender: "admin",
-      text: trimmedMessage,
-
-      // Simple readable timestamp
-      timestamp: new Date().toISOString(),
-    };
+    const messagesRef = collection(
+      conversationRef,
+      "messages"
+    );
 
     try {
-      const chatRef = doc(
-        db,
-        "messages",
-        selectedChat.id
-      );
-
-      await updateDoc(chatRef, {
-        messages: arrayUnion(newMessage),
-
-        /*
-         * Updated so the conversation moves
-         * to the top of the list.
-         */
-        updatedAt: serverTimestamp(),
-
-        /*
-         * Admin is sending the message,
-         * so admin unread stays at 0.
-         */
-        unread: 0,
+      /*
+       * Add the actual message document to the
+       * conversation's messages subcollection.
+       */
+      await addDoc(messagesRef, {
+        senderId: "admin",
+        senderRole: "admin",
+        senderName: "MPRSS Admin",
+        message: trimmedMessage,
+        createdAt: serverTimestamp(),
       });
+
+      /*
+       * Update conversation preview and unread count.
+       *
+       * Admin is sending, so:
+       * - unreadForRecipient = 0
+       * - customer's unread count increases by 1
+       */
+      await updateDoc(conversationRef, {
+        lastMessage: trimmedMessage,
+        lastMessageAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+        unreadForRecipient: 0,
+        unreadForCustomer: increment(1),
+      });
+
+      const customerId =
+        selectedChat.customerUid ||
+        selectedChat.customerId ||
+        selectedChat.userId ||
+        "";
+
+      if (customerId) {
+        await addDoc(collection(db, "notifications"), {
+          customerId,
+          recipientRole: "customer",
+          type: "message",
+          title: "New Reply from MPRSS",
+          message: trimmedMessage.length > 140
+            ? `${trimmedMessage.slice(0, 137)}...`
+            : trimmedMessage,
+          route: "/messages",
+          conversationId: selectedChat.id,
+          read: false,
+          createdAt: serverTimestamp(),
+        });
+      } else {
+        console.warn(
+          "Message was sent, but no customer UID was found for notification.",
+          selectedChat.id
+        );
+      }
 
       setMessageText("");
     } catch (error) {
@@ -209,27 +360,78 @@ export default function AdminMessages() {
         "function"
       ) {
         date = timestamp.toDate();
+      } else if (
+        typeof timestamp?.seconds ===
+        "number"
+      ) {
+        date = new Date(
+          timestamp.seconds * 1000 +
+            Math.floor(
+              (timestamp.nanoseconds || 0) / 1000000
+            )
+        );
       } else {
         date = new Date(timestamp);
       }
 
       if (Number.isNaN(date.getTime())) {
-        return String(timestamp);
+        return "";
       }
 
-      return date.toLocaleString("en-US", {
+      return date.toLocaleString("en-PH", {
+        timeZone: "Asia/Manila",
         hour: "2-digit",
         minute: "2-digit",
         hour12: false,
       });
     } catch {
-      return String(timestamp);
+      return "";
+    }
+  };
+
+  /*
+   * ============================================================
+   * FORMAT CONVERSATION TIME
+   * ============================================================
+   */
+
+  const formatConversationTime = (timestamp) => {
+    if (!timestamp) {
+      return "";
+    }
+
+    try {
+      let date;
+
+      if (typeof timestamp?.toDate === "function") {
+        date = timestamp.toDate();
+      } else if (typeof timestamp?.seconds === "number") {
+        date = new Date(
+          timestamp.seconds * 1000 +
+            Math.floor(
+              (timestamp.nanoseconds || 0) / 1000000
+            )
+        );
+      } else {
+        date = new Date(timestamp);
+      }
+
+      if (Number.isNaN(date.getTime())) {
+        return "";
+      }
+
+      return date.toLocaleDateString("en-PH", {
+        timeZone: "Asia/Manila",
+        month: "short",
+        day: "numeric",
+      });
+    } catch {
+      return "";
     }
   };
 
   return (
     <AdminLayout title="Messages">
-
       {/* ======================================================
           FIRESTORE ERROR
       ======================================================= */}
@@ -256,13 +458,11 @@ export default function AdminMessages() {
       ======================================================= */}
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 h-[calc(100vh-200px)]">
-
         {/* ====================================================
             CHAT LIST
         ===================================================== */}
 
         <div className="bg-white rounded-lg shadow overflow-hidden">
-
           <div className="p-4 border-b border-gray-200">
             <h3 className="text-lg">
               Conversations
@@ -270,72 +470,63 @@ export default function AdminMessages() {
           </div>
 
           <div className="overflow-y-auto h-full">
-
             {chats.length === 0 ? (
               <div className="p-6 text-center text-gray-500 text-sm">
                 No conversations yet.
               </div>
             ) : (
               chats.map((chat) => {
-
-                const chatMessages =
-                  Array.isArray(
-                    chat.messages
-                  )
-                    ? chat.messages
-                    : [];
-
-                const lastMessage =
-                  chatMessages.length > 0
-                    ? chatMessages[
-                        chatMessages.length - 1
-                      ]
-                    : null;
-
                 return (
                   <div
                     key={chat.id}
                     onClick={() =>
-                      handleSelectChat(
-                        chat.id
-                      )
+                      handleSelectChat(chat.id)
                     }
                     className={`p-4 border-b border-gray-100 cursor-pointer hover:bg-gray-50 ${
-                      selectedChatId ===
-                      chat.id
+                      selectedChatId === chat.id
                         ? "bg-gray-50"
                         : ""
                     }`}
                   >
-
-                    <div className="flex justify-between items-start">
-
-                      <p className="font-medium">
+                    <div className="flex justify-between items-start gap-3">
+                      <p className="font-medium truncate">
                         {chat.customerName ||
                           "Customer"}
                       </p>
 
                       {Number(
-                        chat.unread || 0
+                        chat.unreadForRecipient || 0
                       ) > 0 && (
-                        <span className="bg-black text-white text-xs px-2 py-1 rounded-full">
-                          {chat.unread}
+                        <span className="bg-black text-white text-xs px-2 py-1 rounded-full shrink-0">
+                          {chat.unreadForRecipient}
                         </span>
                       )}
-
                     </div>
 
-                    <p className="text-sm text-gray-600 mt-1 truncate">
-                      {lastMessage
-                        ? lastMessage.text
-                        : "No messages yet"}
-                    </p>
+                    <div className="flex items-end justify-between gap-3">
+                      <p className="text-sm text-gray-600 mt-1 truncate">
+                        {chat.lastMessage ||
+                          "No messages yet"}
+                      </p>
 
+                      {chat.lastMessageAt && (
+                        <span className="text-[10px] text-gray-400 shrink-0">
+                          {formatConversationTime(
+                            chat.lastMessageAt
+                          )}
+                        </span>
+                      )}
+                    </div>
+
+                    {chat.customerEmail && (
+                      <p className="text-[11px] text-gray-400 mt-1 truncate">
+                        {chat.customerEmail}
+                      </p>
+                    )}
                   </div>
                 );
               })
             )}
-
           </div>
         </div>
 
@@ -344,12 +535,10 @@ export default function AdminMessages() {
         ===================================================== */}
 
         <div className="lg:col-span-2 bg-white rounded-lg shadow flex flex-col">
-
           {selectedChat ? (
             <>
               {/* Chat Header */}
               <div className="p-4 border-b border-gray-200 flex items-center gap-3">
-
                 <button
                   onClick={() =>
                     setSelectedChatId(null)
@@ -371,70 +560,59 @@ export default function AdminMessages() {
                     </p>
                   )}
                 </div>
-
               </div>
 
               {/* Messages */}
               <div className="flex-1 overflow-y-auto p-4 space-y-4">
-
-                {Array.isArray(
-                  selectedChat.messages
-                ) &&
-                selectedChat.messages.length > 0 ? (
-                  selectedChat.messages.map(
-                    (msg, idx) => (
+                {messagesLoading ? (
+                  <div className="text-center text-gray-400 text-sm py-10">
+                    Loading messages...
+                  </div>
+                ) : selectedMessages.length > 0 ? (
+                  selectedMessages.map((msg) => (
+                    <div
+                      key={msg.id}
+                      className={`flex ${
+                        msg.senderRole === "admin"
+                          ? "justify-end"
+                          : "justify-start"
+                      }`}
+                    >
                       <div
-                        key={`${selectedChat.id}-${idx}`}
-                        className={`flex ${
-                          msg.sender === "admin"
-                            ? "justify-end"
-                            : "justify-start"
+                        className={`max-w-xs lg:max-w-md px-4 py-2 rounded-lg ${
+                          msg.senderRole === "admin"
+                            ? "bg-black text-white"
+                            : "bg-gray-100 text-gray-900"
                         }`}
                       >
+                        <p className="text-sm whitespace-pre-wrap break-words">
+                          {msg.message || ""}
+                        </p>
 
-                        <div
-                          className={`max-w-xs lg:max-w-md px-4 py-2 rounded-lg ${
-                            msg.sender ===
-                            "admin"
-                              ? "bg-black text-white"
-                              : "bg-gray-100 text-gray-900"
+                        <p
+                          className={`text-xs mt-1 ${
+                            msg.senderRole === "admin"
+                              ? "text-gray-300"
+                              : "text-gray-500"
                           }`}
                         >
-
-                          <p className="text-sm">
-                            {msg.text}
-                          </p>
-
-                          <p
-                            className={`text-xs mt-1 ${
-                              msg.sender ===
-                              "admin"
-                                ? "text-gray-300"
-                                : "text-gray-500"
-                            }`}
-                          >
-                            {formatMessageTime(
-                              msg.timestamp
-                            )}
-                          </p>
-
-                        </div>
+                          {formatMessageTime(
+                            msg.createdAt
+                          )}
+                        </p>
                       </div>
-                    )
-                  )
+                    </div>
+                  ))
                 ) : (
                   <div className="text-center text-gray-400 text-sm py-10">
                     No messages yet.
                   </div>
                 )}
-
               </div>
 
               {/* Message Input */}
               <div className="p-4 border-t border-gray-200">
-
                 <div className="flex gap-2">
-
                   <input
                     type="text"
                     value={messageText}
@@ -445,8 +623,10 @@ export default function AdminMessages() {
                     }
                     onKeyDown={(e) => {
                       if (
-                        e.key === "Enter"
+                        e.key === "Enter" &&
+                        !e.shiftKey
                       ) {
+                        e.preventDefault();
                         handleSend();
                       }
                     }}
@@ -463,9 +643,7 @@ export default function AdminMessages() {
                   >
                     <Send size={20} />
                   </button>
-
                 </div>
-
               </div>
             </>
           ) : (
@@ -473,7 +651,6 @@ export default function AdminMessages() {
               Select a conversation to start messaging
             </div>
           )}
-
         </div>
       </div>
     </AdminLayout>

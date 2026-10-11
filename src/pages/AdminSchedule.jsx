@@ -881,11 +881,105 @@ function AdminSchedule() {
     return `${year}-${month}-${dayStr}`;
   };
 
+  /*
+   * Customer service requests are the primary source for calendar
+   * occupancy. This keeps the admin schedule synchronized with the
+   * date/time selected by a customer in the service request calendar.
+   *
+   * Existing `schedules` documents are also considered so older/manual
+   * appointments remain visible. The same service is not counted twice.
+   */
+  const isServiceCalendarBooking = (service) => {
+    const status = String(service.status || "")
+      .toLowerCase()
+      .trim();
+
+    const approvalStatus = String(service.approvalStatus || "")
+      .toLowerCase()
+      .trim();
+
+    if (
+      status === "rejected" ||
+      status === "cancelled" ||
+      status === "canceled" ||
+      approvalStatus === "rejected"
+    ) {
+      return false;
+    }
+
+    return true;
+  };
+
+  const getCustomerRequestedBookedSlots = (dateStr) => {
+    const bookedSlots = {};
+
+    allServices.forEach((service) => {
+      if (!isServiceCalendarBooking(service)) {
+        return;
+      }
+
+      const serviceDate =
+        service.preferredDate ||
+        service.date ||
+        service.scheduleDate ||
+        service.requestDate ||
+        "";
+
+      const serviceTime =
+        service.preferredTime ||
+        service.time ||
+        service.scheduleTime ||
+        "";
+
+      if (
+        serviceDate !== dateStr ||
+        !serviceTime ||
+        !TIME_SLOTS.includes(serviceTime)
+      ) {
+        return;
+      }
+
+      bookedSlots[serviceTime] =
+        Number(bookedSlots[serviceTime] || 0) + 1;
+    });
+
+    return bookedSlots;
+  };
+
+  const getMergedBookedSlots = (dateStr) => {
+    const scheduleBookedSlots =
+      shopSchedule.bookedSlots[dateStr] || {};
+
+    const customerRequestedSlots =
+      getCustomerRequestedBookedSlots(dateStr);
+
+    const mergedSlots = {};
+
+    shopSchedule.timeSlots.forEach((time) => {
+      const scheduleCount =
+        Number(scheduleBookedSlots[time] || 0);
+
+      const requestedCount =
+        Number(customerRequestedSlots[time] || 0);
+
+      /*
+       * Manual/admin schedules also create a service document.
+       * Taking the larger value prevents that same appointment
+       * from being counted twice.
+       */
+      mergedSlots[time] =
+        Math.max(
+          scheduleCount,
+          requestedCount
+        );
+    });
+
+    return mergedSlots;
+  };
+
   const getDateStatus = (dateStr) => {
     const bookedSlots =
-      shopSchedule.bookedSlots[
-        dateStr
-      ] || {};
+      getMergedBookedSlots(dateStr);
 
     let occupiedSlotCount = 0;
 
@@ -902,9 +996,14 @@ function AdminSchedule() {
     const totalSlots =
       shopSchedule.timeSlots.length;
 
+    const isBlocked =
+      isDateBlocked(dateStr) ||
+      isHoliday(dateStr);
+
     const isFullyBooked =
       occupiedSlotCount >=
-      totalSlots;
+        totalSlots ||
+      isBlocked;
 
     const isPartial =
       occupiedSlotCount > 0 &&
@@ -913,6 +1012,7 @@ function AdminSchedule() {
     return {
       isFullyBooked,
       isPartial,
+      isBlocked,
       occupiedSlotCount,
       totalSlots,
     };
@@ -920,9 +1020,7 @@ function AdminSchedule() {
 
   const getOccupiedSlots = (dateStr) => {
     const bookedSlots =
-      shopSchedule.bookedSlots[
-        dateStr
-      ] || {};
+      getMergedBookedSlots(dateStr);
 
     return shopSchedule.timeSlots.filter(
       (time) =>
@@ -1022,32 +1120,45 @@ function AdminSchedule() {
               scheduleData.blockedSlots ||
               {};
 
+            const reason =
+              blockForm.reason.trim() ||
+              "Blocked";
+
+            const isWholeDay =
+              blockForm.timeSlot === "__whole_day__";
+
+            const slotsToBlock = isWholeDay
+              ? shopSchedule.timeSlots
+              : [blockForm.timeSlot];
+
+            const updatedBookedSlots = {
+              ...existingBookedSlots,
+            };
+
+            const updatedBlockedSlots = {
+              ...existingBlockedSlots,
+            };
+
+            slotsToBlock.forEach((timeSlot) => {
+              updatedBookedSlots[timeSlot] =
+                DAILY_CAPACITY;
+
+              updatedBlockedSlots[timeSlot] = {
+                reason,
+                blockedAt:
+                  new Date().toISOString(),
+                wholeDay: isWholeDay,
+              };
+            });
+
             transaction.set(
               scheduleRef,
               {
                 date: selectedDate,
-
-                bookedSlots: {
-                  ...existingBookedSlots,
-
-                  [blockForm.timeSlot]:
-                    DAILY_CAPACITY,
-                },
-
-                blockedSlots: {
-                  ...existingBlockedSlots,
-
-                  [blockForm.timeSlot]: {
-                    reason:
-                      blockForm.reason.trim() ||
-                      "Blocked",
-                    blockedAt:
-                      new Date().toISOString(),
-                  },
-                },
-
-                updatedAt:
-                  serverTimestamp(),
+                blockedAllDay: isWholeDay || scheduleData.blockedAllDay === true,
+                bookedSlots: updatedBookedSlots,
+                blockedSlots: updatedBlockedSlots,
+                updatedAt: serverTimestamp(),
               },
               {
                 merge: true,
@@ -1198,6 +1309,7 @@ function AdminSchedule() {
   const getApptTime = (appt) =>
     appt.preferredTime ||
     "—";
+
   return (
     <AdminLayout title="Schedules">
 
@@ -1292,16 +1404,14 @@ function AdminSchedule() {
               const status = getDateStatus(dateStr);
               const todayDay = isToday(day);
               const isSelected = selectedDate === dateStr;
-              const holidayDay = isHoliday(dateStr);
-              const blockedDay = isDateBlocked(dateStr);
 
-              let cellClass = 'bg-white text-gray-700 hover:bg-gray-100';
-              if (holidayDay) cellClass = 'bg-purple-50 text-purple-700 hover:bg-purple-100';
-              else if (blockedDay) cellClass = 'bg-red-50 text-red-600 hover:bg-red-100';
-              else if (status.isFullyBooked) cellClass = 'bg-gray-800 text-white hover:bg-gray-700';
-              else if (status.isPartial) cellClass = 'bg-amber-50 text-amber-800 hover:bg-amber-100';
+              let cellClass = 'bg-green-50 text-green-700 hover:bg-green-100';
 
-              if (isSelected) cellClass = 'bg-[#0a0f1a] text-white hover:bg-[#1e293b]';
+              if (status.isFullyBooked || status.isBlocked) {
+                cellClass = 'bg-red-100 text-red-700 hover:bg-red-200';
+              } else if (status.isPartial) {
+                cellClass = 'bg-amber-100 text-amber-800 hover:bg-amber-200';
+              }
 
               return (
                 <button
@@ -1310,33 +1420,14 @@ function AdminSchedule() {
                   className={`
                     aspect-square rounded-lg flex items-center justify-center text-xs font-medium transition-colors relative
                     ${cellClass}
+                    ${isSelected ? 'ring-2 ring-[#0a0f1a] ring-inset' : ''}
                     ${todayDay && !isSelected ? 'ring-1 ring-[#0a0f1a] ring-inset' : ''}
                   `}
                 >
                   {day}
-                  {status.isPartial && !isSelected && (
-                    <span className="absolute bottom-0.5 left-1/2 -translate-x-1/2 w-1 h-1 rounded-full bg-amber-400" />
-                  )}
                 </button>
               );
             })}
-          </div>
-
-          {/* Legend */}
-          <div className="mt-4 pt-3 border-t border-gray-100 grid grid-cols-2 gap-x-4 gap-y-1.5">
-            {[
-              { color: 'bg-white border border-gray-200', label: 'Available' },
-              { color: 'bg-amber-100', label: 'Partial' },
-              { color: 'bg-gray-800', label: 'Full' },
-              { color: 'bg-[#0a0f1a]', label: 'Selected' },
-              { color: 'bg-red-100', label: 'Blocked' },
-              { color: 'bg-purple-100', label: 'Holiday' },
-            ].map(({ color, label }) => (
-              <div key={label} className="flex items-center gap-1.5">
-                <div className={`w-2.5 h-2.5 rounded-sm shrink-0 ${color}`} />
-                <span className="text-[10px] text-gray-500">{label}</span>
-              </div>
-            ))}
           </div>
         </div>
 
@@ -1360,9 +1451,9 @@ function AdminSchedule() {
             <div className="h-2 bg-gray-100 rounded-full overflow-hidden">
               <div
                 className={`h-full rounded-full transition-all duration-300 ${
-                  capacityPct >= 100 ? 'bg-gray-800' :
+                  capacityPct >= 100 ? 'bg-red-500' :
                   capacityPct >= 60 ? 'bg-amber-500' :
-                  'bg-[#0a0f1a]'
+                  'bg-green-500'
                 }`}
                 style={{ width: `${Math.min(capacityPct, 100)}%` }}
               />
@@ -1385,10 +1476,6 @@ function AdminSchedule() {
                 </div>
               ) : (
                 mechanics.map((mechanic) => {
-                  /*
-                   * Get appointments assigned to this mechanic
-                   * for the currently selected date.
-                   */
                   const mechanicAppointments =
                     selectedAppointments.filter(
                       (appointment) =>
@@ -1396,10 +1483,6 @@ function AdminSchedule() {
                         appointment.assignedStaff === mechanic.name
                     );
 
-                  /*
-                   * Count unique appointment times so one mechanic
-                   * slot is counted once per time slot.
-                   */
                   const occupiedMechanicTimes = [
                     ...new Set(
                       mechanicAppointments
@@ -1411,25 +1494,15 @@ function AdminSchedule() {
                     ),
                   ];
 
-                  /*
-                   * Count blocked time slots for the selected date.
-                   */
                   const blockedTimes = Object.keys(
                     blockedSchedules[selectedDate] || {}
                   );
 
-                  /*
-                   * Total time slots available to this mechanic
-                   * on the selected date.
-                   */
                   const totalAvailableTimeSlots =
                     shopSchedule.timeSlots.filter(
                       (time) => !blockedTimes.includes(time)
                     ).length;
 
-                  /*
-                   * Remaining appointment slots for this mechanic.
-                   */
                   const availableMechanicSlots =
                     mechanic.available
                       ? Math.max(
@@ -1461,7 +1534,7 @@ function AdminSchedule() {
                               : mechanicStatus === "Partially Booked"
                               ? "bg-amber-400"
                               : mechanicStatus === "Fully Booked"
-                              ? "bg-gray-700"
+                              ? "bg-red-500"
                               : "bg-gray-300"
                           }`}
                         />
@@ -1489,7 +1562,7 @@ function AdminSchedule() {
                               : mechanicStatus === "Partially Booked"
                               ? "text-amber-600"
                               : mechanicStatus === "Fully Booked"
-                              ? "text-gray-700"
+                              ? "text-red-600"
                               : "text-gray-400"
                           }`}
                         >
@@ -1872,7 +1945,7 @@ function AdminSchedule() {
         </div>
       )}
 
-      {/* ── BLOCK SCHEDULE MODAL ─────────────────────────────────────── */}
+      {/* ── BLOCK SCHEDULE MODAL ─────────────────────────────────────── */} 
       {showBlockModal && (
         <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
           <div className="bg-white rounded-xl shadow-xl p-6 max-w-md w-full">
@@ -1897,6 +1970,7 @@ function AdminSchedule() {
                   className="w-full px-3 py-2.5 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-gray-400 text-sm bg-white"
                 >
                   <option value="">Select time slot</option>
+                  <option value="__whole_day__">Whole Day</option>
                   {shopSchedule.timeSlots.map((time) => (
                     <option key={time} value={time}>{time}</option>
                   ))}
@@ -1930,7 +2004,7 @@ function AdminSchedule() {
                 onClick={handleBlockSchedule}
                 className="flex-1 bg-[#0a0f1a] text-white py-2.5 rounded-lg hover:bg-[#1e293b] text-sm font-medium transition-colors"
               >
-                Block Time Slot
+                Block Schedule
               </button>
               <button
                 onClick={() => setShowBlockModal(false)}
