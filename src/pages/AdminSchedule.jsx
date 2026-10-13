@@ -23,6 +23,7 @@ import { db } from "../firebase";
 const todayStr = new Date().toISOString().split("T")[0];
 
 const DAILY_CAPACITY = 5;
+const MECHANIC_DAILY_LIMIT = 8;
 
 const TIME_SLOTS = [
   "8:00 AM",
@@ -280,12 +281,33 @@ function AdminSchedule() {
    * ============================================================
    */
 
+  const isActiveBooking = (service) => {
+    const status = String(service.status || "").toLowerCase().trim();
+    const approvalStatus = String(service.approvalStatus || "").toLowerCase().trim();
+    return !["rejected", "cancelled", "canceled"].includes(status) && approvalStatus !== "rejected";
+  };
+
+  const getMechanicDailyBookingCount = (mechanic, date) => {
+    if (!mechanic || !date) return 0;
+    return allServices.filter((service) => {
+      if (!isActiveBooking(service)) return false;
+      const serviceDate = service.preferredDate || service.date || service.scheduleDate || service.requestDate || "";
+      if (serviceDate !== date) return false;
+      return service.assignedStaffId === mechanic.id || service.assignedStaff === mechanic.name;
+    }).length;
+  };
+
   const availableMechanicsForAdd = mechanics.filter((mechanic) => {
     if (!mechanic.available) {
       return false;
     }
 
-    // Before a time is selected, show all active staff.
+    // Enforce the daily cap across every time block, not just this slot.
+    if (addForm.date && getMechanicDailyBookingCount(mechanic, addForm.date) >= MECHANIC_DAILY_LIMIT) {
+      return false;
+    }
+
+    // Before a time is selected, show active staff who still have daily capacity.
     if (!addForm.date || !addForm.time) {
       return true;
     }
@@ -642,6 +664,12 @@ function AdminSchedule() {
         );
 
       if (!selectedStaff) {
+        return;
+      }
+
+      const currentDailyBookings = getMechanicDailyBookingCount(selectedStaff, addForm.date);
+      if (currentDailyBookings >= MECHANIC_DAILY_LIMIT) {
+        window.alert(`${selectedStaff.name} already has ${MECHANIC_DAILY_LIMIT} bookings on ${addForm.date}. Please choose another mechanic or date.`);
         return;
       }
 
@@ -1019,13 +1047,16 @@ function AdminSchedule() {
   };
 
   const getOccupiedSlots = (dateStr) => {
-    const bookedSlots =
-      getMergedBookedSlots(dateStr);
-
-    return shopSchedule.timeSlots.filter(
-      (time) =>
-        (bookedSlots[time] || 0) > 0
-    ).length;
+    return allServices.filter((service) => {
+      if (!isServiceCalendarBooking(service)) return false;
+      const serviceDate =
+        service.preferredDate ||
+        service.date ||
+        service.scheduleDate ||
+        service.requestDate ||
+        "";
+      return serviceDate === dateStr;
+    }).length;
   };
 
   const isToday = (day) => {
@@ -1202,12 +1233,12 @@ function AdminSchedule() {
       selectedDate
     );
 
+  // Daily capacity is 8 bookings per available mechanic, not 15 hourly slots.
   const totalSlots =
-    shopSchedule.timeSlots.length;
+    mechanics.length * MECHANIC_DAILY_LIMIT;
 
   const availableToday =
-    totalSlots -
-    occupiedToday;
+    Math.max(totalSlots - occupiedToday, 0);
 
   const blockedHoursToday =
     Object.keys(
@@ -1493,21 +1524,25 @@ function AdminSchedule() {
                         .filter(Boolean)
                     ),
                   ];
+                  const mechanicBookingCount =
+                    getMechanicDailyBookingCount(mechanic, selectedDate);
 
                   const blockedTimes = Object.keys(
                     blockedSchedules[selectedDate] || {}
                   );
 
                   const totalAvailableTimeSlots =
-                    shopSchedule.timeSlots.filter(
-                      (time) => !blockedTimes.includes(time)
-                    ).length;
+                    Math.max(
+                      MECHANIC_DAILY_LIMIT -
+                        blockedTimes.length,
+                      0
+                    );
 
                   const availableMechanicSlots =
                     mechanic.available
                       ? Math.max(
-                          totalAvailableTimeSlots -
-                            occupiedMechanicTimes.length,
+                          MECHANIC_DAILY_LIMIT -
+                            mechanicBookingCount,
                           0
                         )
                       : 0;
@@ -1517,7 +1552,7 @@ function AdminSchedule() {
                       ? "Unavailable"
                       : availableMechanicSlots === 0
                       ? "Fully Booked"
-                      : occupiedMechanicTimes.length > 0
+                      : mechanicBookingCount > 0
                       ? "Partially Booked"
                       : "Available";
 
@@ -1545,8 +1580,8 @@ function AdminSchedule() {
                           </p>
 
                           <p className="text-[10px] text-gray-400">
-                            {mechanicAppointments.length}{" "}
-                            {mechanicAppointments.length === 1
+                            {mechanicBookingCount}{" "}
+                            {mechanicBookingCount === 1
                               ? "appointment"
                               : "appointments"}{" "}
                             assigned
@@ -1574,8 +1609,8 @@ function AdminSchedule() {
                         </p>
 
                         <p className="text-[10px] text-gray-400">
-                          {occupiedMechanicTimes.length}/
-                          {totalAvailableTimeSlots} booked
+                          {mechanicBookingCount}/
+                          {MECHANIC_DAILY_LIMIT} booked
                         </p>
                       </div>
                     </div>
@@ -1608,7 +1643,7 @@ function AdminSchedule() {
             <div className="flex-1 flex flex-col items-center justify-center text-center py-6">
               <Calendar size={28} className="text-gray-200 mb-2" />
               <p className="text-sm text-gray-400">No bookings for this date</p>
-              <p className="text-xs text-gray-300 mt-0.5">All {totalSlots} slots available</p>
+              <p className="text-xs text-gray-300 mt-0.5">Daily capacity: {totalSlots} bookings across {mechanics.length} mechanics</p>
             </div>
           )}
         </div>

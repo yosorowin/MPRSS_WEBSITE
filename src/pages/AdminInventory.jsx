@@ -24,17 +24,11 @@ import {
   deleteDoc,
 } from "firebase/firestore";
 
-import {
-  getStorage,
-  ref,
-  uploadBytes,
-  getDownloadURL,
-  deleteObject,
-} from "firebase/storage";
-
 import { db } from "../firebase";
 
-const storage = getStorage();
+// Cloudinary is used only to host inventory photos. Firestore remains the database.
+const CLOUDINARY_CLOUD_NAME = "aizdadkl";
+const CLOUDINARY_UPLOAD_PRESET = "mprss_inventory";
 
 const CATEGORY_OPTIONS = [
   "Engine Parts",
@@ -391,27 +385,55 @@ function AdminInventory() {
       };
     }
 
-    const extension =
-      selectedPhoto.name.split(".").pop()?.toLowerCase() || "jpg";
+    const allowedTypes = ["image/jpeg", "image/png", "image/webp"];
+    if (!allowedTypes.includes(selectedPhoto.type)) {
+      throw new Error("Please upload a JPG, PNG, or WebP image.");
+    }
 
-    const photoPath = `inventory/${inventoryId}/product-${Date.now()}.${extension}`;
-    const storageRef = ref(storage, photoPath);
+    if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_UPLOAD_PRESET) {
+      throw new Error("Cloudinary upload settings are missing.");
+    }
 
     setUploadingPhoto(true);
 
     try {
-      await uploadBytes(storageRef, selectedPhoto);
-      const photoUrl = await getDownloadURL(storageRef);
+      const uploadData = new FormData();
+      uploadData.append("file", selectedPhoto);
+      uploadData.append("upload_preset", CLOUDINARY_UPLOAD_PRESET);
+      // Keep uploads grouped by project and inventory item in Cloudinary.
+      uploadData.append("folder", `mprss/inventory/${inventoryId}`);
 
-      if (formData.photoPath && formData.photoPath !== photoPath) {
-        try {
-          await deleteObject(ref(storage, formData.photoPath));
-        } catch (error) {
-          console.warn("Old product photo could not be deleted:", error);
-        }
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 60000);
+      let response;
+      try {
+        response = await fetch(
+          `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/upload`,
+          { method: "POST", body: uploadData, signal: controller.signal }
+        );
+      } finally {
+        clearTimeout(timeoutId);
       }
 
-      return { photoUrl, photoPath };
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok || !result.secure_url) {
+        throw new Error(
+          result?.error?.message ||
+            `Cloudinary photo upload failed (${response.status}). Check the cloud name and unsigned upload preset.`
+        );
+      }
+
+      // photoPath stores Cloudinary's public_id for reference only. Unsigned
+      // browser uploads cannot securely delete old Cloudinary assets directly.
+      return {
+        photoUrl: result.secure_url,
+        photoPath: result.public_id || `mprss/inventory/${inventoryId}`,
+      };
+    } catch (error) {
+      if (error?.name === "AbortError") {
+        throw new Error("Photo upload timed out. Please check your connection and try again.");
+      }
+      throw error;
     } finally {
       setUploadingPhoto(false);
     }
@@ -554,15 +576,9 @@ function AdminInventory() {
     if (!confirmed) return;
 
     try {
+      // Delete the Firestore product record. Cloudinary asset deletion requires
+      // a trusted server-side API and is intentionally not attempted in the browser.
       await deleteDoc(doc(db, "inventory", part.id));
-
-      if (part.photoPath) {
-        try {
-          await deleteObject(ref(storage, part.photoPath));
-        } catch (error) {
-          console.warn("Product photo could not be deleted:", error);
-        }
-      }
     } catch (error) {
       console.error("Error deleting inventory item:", error);
       alert("Failed to delete inventory item. Please try again.");
@@ -1032,13 +1048,15 @@ function AdminInventory() {
       </div>
 
       {showModal && (
-        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-start justify-center z-50 p-4 overflow-y-auto">
-          <div className="bg-white rounded-xl p-6 max-w-2xl w-full my-4 shadow-xl max-h-[calc(100vh-2rem)] overflow-y-auto">
-            <h3 className="text-base font-semibold text-gray-900 mb-5">
+        <div className="fixed inset-0 bg-slate-950/55 backdrop-blur-sm flex items-center justify-center z-50 p-3 sm:p-4 overflow-y-auto">
+          <div className="bg-white rounded-2xl p-4 sm:p-6 max-w-7xl w-full my-auto shadow-2xl max-h-[calc(100vh-2rem)] overflow-y-auto">
+            <div className="flex items-center justify-between gap-4 mb-5 pb-3 border-b border-slate-100"><div><p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-400">Inventory management</p><h3 className="text-lg font-semibold text-slate-900 mt-0.5">
               {isEditing ? "Edit Part" : "Add New Part"}
-            </h3>
+            </h3></div><div className="text-xs text-slate-400 hidden sm:block">Fields marked * are required</div></div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 mb-6">
+<div className="flex flex-col gap-3 min-w-0">
+
               <div>
                 <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wider mb-1.5">
                   Part Name *
@@ -1053,36 +1071,6 @@ function AdminInventory() {
                 />
               </div>
 
-              <div className="md:col-span-2">
-                <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">
-                  Category *
-                </label>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 border border-gray-200 rounded-lg p-3">
-                  {CATEGORY_OPTIONS.map((category) => (
-                    <label
-                      key={category}
-                      className={`flex items-center gap-2 p-2 rounded-lg cursor-pointer transition-colors ${
-                        formData.category === category
-                          ? "bg-gray-100"
-                          : "hover:bg-gray-50"
-                      }`}
-                    >
-                      <input
-                        type="checkbox"
-                        checked={formData.category === category}
-                        onChange={() => handleCategoryChange(category)}
-                        className="w-4 h-4 rounded"
-                      />
-                      <span className="text-sm text-gray-700">{category}</span>
-                    </label>
-                  ))}
-                </div>
-
-                <p className="text-[11px] text-gray-400 mt-1.5">
-                  Select one category for this part.
-                </p>
-              </div>
 
               <div>
                 <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wider mb-1.5">
@@ -1098,6 +1086,7 @@ function AdminInventory() {
                   className="w-full px-3 py-2 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-gray-400 text-sm"
                 />
               </div>
+
 
               <div>
                 <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wider mb-1.5">
@@ -1117,6 +1106,7 @@ function AdminInventory() {
                 </p>
               </div>
 
+
               <div>
                 <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wider mb-1.5">
                   Price (₱) *
@@ -1131,6 +1121,27 @@ function AdminInventory() {
                   className="w-full px-3 py-2 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-gray-400 text-sm"
                 />
               </div>
+
+
+              {/* Safety Notes */}
+              <div className="md:col-span-2">
+                <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wider mb-1.5">
+                  Safety Notes
+                </label>
+                <textarea
+                  value={formData.safetyNotes}
+                  onChange={(e) =>
+                    setFormData({
+                      ...formData,
+                      safetyNotes: e.target.value,
+                    })
+                  }
+                  className="w-full px-3 py-2 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-gray-400 text-sm"
+                  rows={2}
+                  placeholder="Optional safety or installation notes..."
+                />
+              </div>
+
 
               {/* Product Photo */}
               <div className="md:col-span-2">
@@ -1209,6 +1220,68 @@ function AdminInventory() {
                   </p>
                 )}
               </div>
+
+
+              {/* Visibility */}
+              <div className="md:col-span-2">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={formData.visibleToCustomers}
+                    onChange={(e) =>
+                      setFormData({
+                        ...formData,
+                        visibleToCustomers: e.target.checked,
+                      })
+                    }
+                    className="w-4 h-4 rounded"
+                  />
+
+                  <span className="text-sm text-gray-700">
+                    Visible to Customers
+                  </span>
+                </label>
+
+                <p className="text-[11px] text-gray-400 mt-1.5 ml-6">
+                  When enabled, customers can see this part in the Parts
+                  Catalog and a product photo is required.
+                </p>
+              </div>
+</div>
+<div className="flex flex-col gap-4 min-w-0">
+
+
+              <div className="md:col-span-2">
+                <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">
+                  Category *
+                </label>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 border border-gray-200 rounded-lg p-3">
+                  {CATEGORY_OPTIONS.map((category) => (
+                    <label
+                      key={category}
+                      className={`flex items-center gap-2 p-2 rounded-lg cursor-pointer transition-colors ${
+                        formData.category === category
+                          ? "bg-gray-100"
+                          : "hover:bg-gray-50"
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={formData.category === category}
+                        onChange={() => handleCategoryChange(category)}
+                        className="w-4 h-4 rounded"
+                      />
+                      <span className="text-sm text-gray-700">{category}</span>
+                    </label>
+                  ))}
+                </div>
+
+                <p className="text-[11px] text-gray-400 mt-1.5">
+                  Select one category for this part.
+                </p>
+              </div>
+
 
               {/* Compatible Motorcycles */}
               <div className="md:col-span-2">
@@ -1338,58 +1411,15 @@ function AdminInventory() {
                     </p>
                   )}
               </div>
+</div>
 
-              {/* Safety Notes */}
-              <div className="md:col-span-2">
-                <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wider mb-1.5">
-                  Safety Notes
-                </label>
-                <textarea
-                  value={formData.safetyNotes}
-                  onChange={(e) =>
-                    setFormData({
-                      ...formData,
-                      safetyNotes: e.target.value,
-                    })
-                  }
-                  className="w-full px-3 py-2 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-gray-400 text-sm"
-                  rows={2}
-                  placeholder="Optional safety or installation notes..."
-                />
-              </div>
-
-              {/* Visibility */}
-              <div className="md:col-span-2">
-                <label className="flex items-center gap-2 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={formData.visibleToCustomers}
-                    onChange={(e) =>
-                      setFormData({
-                        ...formData,
-                        visibleToCustomers: e.target.checked,
-                      })
-                    }
-                    className="w-4 h-4 rounded"
-                  />
-
-                  <span className="text-sm text-gray-700">
-                    Visible to Customers
-                  </span>
-                </label>
-
-                <p className="text-[11px] text-gray-400 mt-1.5 ml-6">
-                  When enabled, customers can see this part in the Parts
-                  Catalog and a product photo is required.
-                </p>
-              </div>
             </div>
 
-            <div className="flex gap-3">
+            <div className="flex justify-end gap-3 pt-4 border-t border-slate-100">
               <button
                 onClick={handleSavePart}
                 disabled={uploadingPhoto}
-                className="flex-1 bg-[#0a0f1a] text-white py-2.5 rounded-lg hover:bg-[#1e293b] text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                className="min-w-36 px-5 bg-[#0a0f1a] text-white py-2.5 rounded-lg hover:bg-[#1e293b] text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {uploadingPhoto
                   ? "Uploading Photo..."
@@ -1401,7 +1431,7 @@ function AdminInventory() {
               <button
                 onClick={closeModal}
                 disabled={uploadingPhoto}
-                className="flex-1 bg-gray-100 text-gray-700 py-2.5 rounded-lg hover:bg-gray-200 text-sm font-medium transition-colors disabled:opacity-50"
+                className="min-w-28 px-5 bg-gray-100 text-gray-700 py-2.5 rounded-lg hover:bg-gray-200 text-sm font-medium transition-colors disabled:opacity-50"
               >
                 Cancel
               </button>

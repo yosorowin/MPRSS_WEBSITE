@@ -629,6 +629,35 @@ const AdminServices = () => {
     setShowApprovalModal(true);
   };
 
+  const getServiceDayKey = (service) => {
+    const value =
+      service?.preferredDate ||
+      service?.scheduleDate ||
+      service?.serviceDate ||
+      service?.appointmentDate ||
+      service?.scheduledDate;
+
+    if (!value) return "";
+
+    let date;
+    if (typeof value?.toDate === "function") {
+      date = value.toDate();
+    } else if (typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value.trim())) {
+      return value.trim();
+    } else {
+      date = value instanceof Date ? value : new Date(value);
+    }
+
+    if (!(date instanceof Date) || Number.isNaN(date.getTime())) {
+      return String(value).trim();
+    }
+
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, "0");
+    const day = String(date.getDate()).padStart(2, "0");
+    return `${year}-${month}-${day}`;
+  };
+
   const handleSaveApproval = async () => {
     if (!selectedService) return;
 
@@ -642,10 +671,46 @@ const AdminServices = () => {
       return;
     }
 
+    if (!assignedStaffId) {
+      alert("Please select a mechanic / staff member.");
+      return;
+    }
+
     try {
       const selectedStaff = mechanics.find(
         (person) => person.id === assignedStaffId
       );
+
+      const selectedDay = getServiceDayKey(selectedService);
+      if (!selectedDay) {
+        alert("This service request has no valid preferred service date. Please check the request before approving it.");
+        return;
+      }
+
+      const excludedStatuses = ["rejected", "cancelled", "canceled", "declined"];
+      const mechanicBookingsForDay = services.filter((service) => {
+        if (service.id === selectedService.id) return false;
+
+        const status = normalizeStatus(service.status);
+        const approvalStatus = normalizeStatus(service.approvalStatus);
+        if (excludedStatuses.includes(status) || excludedStatuses.includes(approvalStatus)) {
+          return false;
+        }
+
+        const serviceStaffId = service.assignedStaffId || service.mechanicId || "";
+        const serviceStaffName = service.assignedStaff || service.assignedStaffName || service.mechanicName || "";
+        const sameMechanic = serviceStaffId
+          ? serviceStaffId === assignedStaffId
+          : Boolean(selectedStaff && serviceStaffName && serviceStaffName === (selectedStaff.fullName || selectedStaff.name));
+
+        return sameMechanic && getServiceDayKey(service) === selectedDay;
+      });
+
+      if (mechanicBookingsForDay.length >= 8) {
+        const mechanicName = selectedStaff?.fullName || selectedStaff?.name || assignedStaff || "This mechanic";
+        alert(`${mechanicName} already has 8 bookings on ${selectedDay}. Please choose another mechanic or date.`);
+        return;
+      }
 
       await updateDoc(
         doc(db, "services", selectedService.id),
@@ -1134,140 +1199,201 @@ const AdminServices = () => {
   // ============================================================
 
   const handlePrint = (service) => {
-    const printWindow = window.open(
-      "",
-      "_blank",
-      "width=800,height=700"
-    );
+    const printWindow = window.open("", "_blank", "width=900,height=750");
 
-    if (!printWindow) return;
+    if (!printWindow) {
+      alert("Please allow pop-ups to print this service invoice.");
+      return;
+    }
 
-    const partsText = Array.isArray(
-      service.partsUsed
-    )
+    // Escape all Firebase/user-provided values before writing them into the print document.
+    const escapeHtml = (value) =>
+      String(value ?? "—").replace(/[&<>"']/g, (character) => {
+        const entities = {
+          "&": "&amp;",
+          "<": "&lt;",
+          ">": "&gt;",
+          '"': "&quot;",
+          "'": "&#39;",
+        };
+        return entities[character];
+      });
+
+    const money = (value) =>
+      `₱${(Number(value) || 0).toLocaleString("en-PH", {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      })}`;
+
+    const serviceId = service.id || "—";
+    const status = getDisplayStatus(service);
+    const completed = normalizeStatus(service.status) === "completed";
+    const parts = Array.isArray(service.partsUsed)
       ? service.partsUsed
-          .map(
-            (part) =>
-              `${part.partName || "Part"} x${
-                part.quantity || 0
-              }`
-          )
-          .join(", ")
-      : service.partsUsed || "—";
+      : [];
+    const partsRows = parts.length
+      ? parts
+          .map((part, index) => {
+            const quantity = Math.max(0, Number(part.quantity) || 0);
+            const unitPrice = Number(
+              part.unitPrice ?? part.price ?? part.unitCost ?? part.costPerUnit
+            );
+            const hasUnitPrice = Number.isFinite(unitPrice) && unitPrice >= 0;
+            const lineTotal = hasUnitPrice ? unitPrice * quantity : null;
+            return `
+              <tr>
+                <td class="item-number">${index + 1}</td>
+                <td>
+                  <strong>${escapeHtml(part.partName || part.name || "Part")}</strong>
+                  ${part.partNumber ? `<div class="muted small">Part No.: ${escapeHtml(part.partNumber)}</div>` : ""}
+                </td>
+                <td class="number">${quantity}</td>
+                <td class="number">${hasUnitPrice ? money(unitPrice) : "—"}</td>
+                <td class="number">${lineTotal === null ? "—" : money(lineTotal)}</td>
+              </tr>`;
+          })
+          .join("")
+      : `<tr><td colspan="5" class="empty-row">No parts recorded for this service.</td></tr>`;
 
-    printWindow.document.write(`
-      <html>
+    const finalCost = Number(service.cost);
+    const estimatedCost = Number(service.estimatedCost ?? service.cost ?? 0);
+    const amountDue = completed && Number.isFinite(finalCost) && service.cost !== ""
+      ? finalCost
+      : estimatedCost;
+    const requestDate = formatDate(service.requestDate || service.createdAt || service.dateRequested);
+    const preferredDate = formatDate(service.preferredDate || service.scheduleDate || service.serviceDate);
+    const printedDate = new Date().toLocaleDateString("en-PH", {
+      month: "long",
+      day: "numeric",
+      year: "numeric",
+    });
+    const documentTitle = completed ? "Service Invoice" : "Service Work Order";
+
+    printWindow.document.open();
+    printWindow.document.write(`<!doctype html>
+      <html lang="en">
         <head>
-          <title>Service Request</title>
-
+          <meta charset="utf-8" />
+          <meta name="viewport" content="width=device-width, initial-scale=1" />
+          <title>${documentTitle} - ${escapeHtml(serviceId)}</title>
           <style>
+            @page { size: A4; margin: 14mm; }
+            * { box-sizing: border-box; }
             body {
-              font-family: Arial, sans-serif;
-              padding: 40px;
-              color: #111827;
+              margin: 0;
+              color: #172033;
+              font-family: Arial, Helvetica, sans-serif;
+              font-size: 12px;
+              line-height: 1.45;
+              background: #fff;
             }
-
-            h1 {
-              margin-bottom: 30px;
-            }
-
-            .row {
-              margin-bottom: 15px;
-            }
-
-            .label {
-              font-weight: bold;
-            }
+            .document { max-width: 780px; margin: 0 auto; }
+            .topbar { height: 7px; background: #111827; margin-bottom: 26px; }
+            .header { display: flex; justify-content: space-between; gap: 24px; align-items: flex-start; padding-bottom: 22px; border-bottom: 2px solid #172033; }
+            .shop-name { margin: 0 0 5px; font-size: 21px; letter-spacing: .4px; font-weight: 800; }
+            .shop-subtitle { color: #64748b; font-size: 11px; }
+            .document-title { margin: 0 0 7px; font-size: 23px; text-transform: uppercase; letter-spacing: .8px; text-align: right; }
+            .status { display: inline-block; border: 1px solid #cbd5e1; border-radius: 20px; padding: 4px 10px; font-size: 10px; font-weight: 700; text-transform: uppercase; }
+            .meta { text-align: right; margin-top: 8px; color: #475569; font-size: 11px; }
+            .meta div { margin-top: 3px; }
+            .section { margin-top: 24px; }
+            .section-title { margin: 0 0 11px; font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 1px; color: #64748b; }
+            .details-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px 30px; }
+            .detail { min-width: 0; }
+            .label { display: block; color: #64748b; font-size: 10px; text-transform: uppercase; letter-spacing: .5px; margin-bottom: 3px; }
+            .value { font-size: 12px; font-weight: 600; overflow-wrap: anywhere; }
+            .description { white-space: pre-wrap; overflow-wrap: anywhere; font-weight: 400; }
+            table { width: 100%; border-collapse: collapse; margin-top: 5px; }
+            thead { display: table-header-group; }
+            th { background: #f1f5f9; color: #334155; text-align: left; font-size: 10px; text-transform: uppercase; letter-spacing: .4px; padding: 10px 8px; border-top: 1px solid #dbe2ea; border-bottom: 1px solid #dbe2ea; }
+            td { padding: 10px 8px; border-bottom: 1px solid #e2e8f0; vertical-align: top; }
+            tr { page-break-inside: avoid; }
+            .number { text-align: right; white-space: nowrap; }
+            .item-number { width: 32px; color: #64748b; }
+            .muted { color: #64748b; }
+            .small { font-size: 10px; }
+            .empty-row { color: #64748b; text-align: center; padding: 18px 8px; }
+            .totals { width: 300px; max-width: 100%; margin: 18px 0 0 auto; }
+            .total-line { display: flex; justify-content: space-between; gap: 16px; padding: 6px 0; color: #475569; }
+            .total-line.grand { margin-top: 5px; padding: 12px 0; border-top: 2px solid #172033; color: #111827; font-size: 15px; font-weight: 800; }
+            .notice { margin-top: 18px; padding: 11px 13px; border: 1px solid #e2e8f0; background: #f8fafc; color: #475569; font-size: 10px; }
+            .footer { margin-top: 42px; padding-top: 13px; border-top: 1px solid #cbd5e1; display: flex; justify-content: space-between; gap: 18px; color: #64748b; font-size: 10px; }
+            .signature { margin-top: 44px; display: grid; grid-template-columns: 1fr 1fr; gap: 50px; }
+            .signature-line { border-top: 1px solid #94a3b8; padding-top: 6px; color: #64748b; font-size: 10px; }
+            @media screen { body { background: #eef2f7; padding: 24px; } .document { background: white; padding: 30px; box-shadow: 0 8px 30px rgba(15,23,42,.08); } }
+            @media print { body { background: white; } .document { max-width: none; } }
           </style>
         </head>
-
         <body>
-          <h1>Service Request</h1>
+          <main class="document">
+            <div class="topbar"></div>
+            <header class="header">
+              <div>
+                <h1 class="shop-name">10th Avenue Motorcycle Shop</h1>
+                <div class="shop-subtitle">Motorcycle Service &amp; Maintenance</div>
+              </div>
+              <div>
+                <h2 class="document-title">${documentTitle}</h2>
+                <div style="text-align:right"><span class="status">${escapeHtml(status)}</span></div>
+                <div class="meta">
+                  <div><strong>Reference:</strong> ${escapeHtml(serviceId)}</div>
+                  <div><strong>Printed:</strong> ${escapeHtml(printedDate)}</div>
+                  <div><strong>Request date:</strong> ${escapeHtml(requestDate)}</div>
+                </div>
+              </div>
+            </header>
 
-          <div class="row">
-            <span class="label">Customer:</span>
-            ${service.customerName || "—"}
-          </div>
+            <section class="section">
+              <h3 class="section-title">Customer &amp; Motorcycle Information</h3>
+              <div class="details-grid">
+                <div class="detail"><span class="label">Customer</span><div class="value">${escapeHtml(service.customerName || "Unknown Customer")}</div></div>
+                <div class="detail"><span class="label">Customer Email</span><div class="value">${escapeHtml(service.customerEmail || service.email || "—")}</div></div>
+                <div class="detail"><span class="label">Motorcycle</span><div class="value">${escapeHtml(service.motorcycleDisplay || formatMotorcycle(service.motorcycle) || "—")}</div></div>
+                <div class="detail"><span class="label">Assigned Mechanic / Staff</span><div class="value">${escapeHtml(service.assignedStaff || service.assignedStaffName || "Not assigned")}</div></div>
+              </div>
+            </section>
 
-          <div class="row">
-            <span class="label">Motorcycle:</span>
-            ${service.motorcycleDisplay || "—"}
-          </div>
+            <section class="section">
+              <h3 class="section-title">Service Details</h3>
+              <div class="details-grid">
+                <div class="detail"><span class="label">Service Type</span><div class="value">${escapeHtml(service.serviceType || "Motorcycle Service")}</div></div>
+                <div class="detail"><span class="label">Scheduled / Preferred Date</span><div class="value">${escapeHtml(preferredDate)}</div></div>
+                <div class="detail"><span class="label">Preferred Time</span><div class="value">${escapeHtml(service.preferredTime || service.scheduleTime || service.serviceTime || "—")}</div></div>
+                <div class="detail"><span class="label">Estimated Duration</span><div class="value">${escapeHtml(service.estimatedTime || "—")}</div></div>
+                <div class="detail"><span class="label">Payment Method</span><div class="value">${escapeHtml(service.paymentMethod || "Not selected")}</div></div>
+                <div class="detail"><span class="label">Payment Status</span><div class="value">${escapeHtml(service.paymentStatus || "Not Yet Paid")}</div></div>
+              </div>
+              ${service.issueDescription ? `<div style="margin-top:17px"><span class="label">Reported Issue / Notes</span><div class="value description">${escapeHtml(service.issueDescription)}</div></div>` : ""}
+            </section>
 
-          <div class="row">
-            <span class="label">Service:</span>
-            ${service.serviceType || "—"}
-          </div>
+            <section class="section">
+              <h3 class="section-title">Parts &amp; Materials</h3>
+              <table>
+                <thead><tr><th>#</th><th>Description</th><th class="number">Qty</th><th class="number">Unit Price</th><th class="number">Amount</th></tr></thead>
+                <tbody>${partsRows}</tbody>
+              </table>
+              <div class="totals">
+                <div class="total-line"><span>Estimated Cost</span><strong>${money(service.estimatedCost)}</strong></div>
+                ${completed ? `<div class="total-line"><span>Final Service Cost</span><strong>${money(service.cost)}</strong></div>` : ""}
+                <div class="total-line grand"><span>${completed ? "Total" : "Estimated Total"}</span><span>${money(amountDue)}</span></div>
+              </div>
+              ${!completed ? `<div class="notice">This is a service work order and cost estimate. Final charges may change after service completion.</div>` : `<div class="notice">Please retain this document for your service records. Part prices are shown only when recorded in the service data.</div>`}
+            </section>
 
-          <div class="row">
-            <span class="label">Preferred Date:</span>
-            ${formatDate(service.preferredDate)}
-          </div>
-
-          <div class="row">
-            <span class="label">Preferred Time:</span>
-            ${service.preferredTime || "—"}
-          </div>
-
-          <div class="row">
-            <span class="label">Status:</span>
-            ${getDisplayStatus(service)}
-          </div>
-
-          <div class="row">
-            <span class="label">Estimated Cost:</span>
-            ₱${Number(
-              service.estimatedCost || 0
-            ).toLocaleString()}
-          </div>
-
-          <div class="row">
-            <span class="label">Final Cost:</span>
-            ₱${Number(
-              service.cost || 0
-            ).toLocaleString()}
-          </div>
-
-          <div class="row">
-            <span class="label">Estimated Time:</span>
-            ${service.estimatedTime || "—"}
-          </div>
-
-          <div class="row">
-            <span class="label">Payment Method:</span>
-            ${service.paymentMethod || "Not selected"}
-          </div>
-
-          <div class="row">
-            <span class="label">Payment Method Approval:</span>
-            ${
-              service.paymentMethodApproved === true
-                ? "Approved"
-                : "Pending"
-            }
-          </div>
-
-          <div class="row">
-            <span class="label">Payment Status:</span>
-            ${service.paymentStatus || "Not Yet Paid"}
-          </div>
-
-          <div class="row">
-            <span class="label">Parts Used:</span>
-            ${partsText}
-          </div>
-
-          <div class="row">
-            <span class="label">Issue:</span>
-            ${service.issueDescription || "—"}
-          </div>
+            <div class="signature">
+              <div class="signature-line">Prepared / Authorized by</div>
+              <div class="signature-line">Customer acknowledgment</div>
+            </div>
+            <footer class="footer"><span>10th Avenue Motorcycle Shop</span><span>Reference: ${escapeHtml(serviceId)}</span></footer>
+          </main>
+          <script>
+            window.addEventListener("load", () => {
+              setTimeout(() => { window.focus(); window.print(); }, 250);
+            });
+          </script>
         </body>
-      </html>
-    `);
-
+      </html>`);
     printWindow.document.close();
-    printWindow.focus();
-    printWindow.print();
   };
 
   // ============================================================
