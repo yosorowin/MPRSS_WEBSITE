@@ -12,6 +12,8 @@ import {
   ChevronRight,
   Upload,
   X,
+  Wrench,
+  Save,
 } from "lucide-react";
 
 import {
@@ -103,6 +105,19 @@ function AdminInventory() {
   const [uploadingPhoto, setUploadingPhoto] = useState(false);
   const [photoPreview, setPhotoPreview] = useState("");
   const [selectedPhoto, setSelectedPhoto] = useState(null);
+  const [activeTab, setActiveTab] = useState("parts");
+  const [servicePackages, setServicePackages] = useState([]);
+  const [packageLoading, setPackageLoading] = useState(true);
+  const [showPackageForm, setShowPackageForm] = useState(false);
+  const [editingPackageId, setEditingPackageId] = useState(null);
+  const [packageSaving, setPackageSaving] = useState(false);
+  const [packageForm, setPackageForm] = useState({
+    name: "",
+    description: "",
+    laborCost: "",
+    active: true,
+    parts: [],
+  });
 
   const emptyForm = {
     name: "",
@@ -142,6 +157,22 @@ function AdminInventory() {
       }
     );
 
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    const unsubscribe = onSnapshot(
+      collection(db, "servicePackages"),
+      (snapshot) => {
+        setServicePackages(snapshot.docs.map((item) => ({ id: item.id, ...item.data() })));
+        setPackageLoading(false);
+      },
+      (error) => {
+        console.error("SERVICE PACKAGES FIRESTORE ERROR:", error);
+        setPackageLoading(false);
+        alert("Unable to load service packages: " + error.message);
+      }
+    );
     return () => unsubscribe();
   }, []);
 
@@ -221,6 +252,103 @@ function AdminInventory() {
 
     return matchesSearch && matchesCategory;
   });
+
+  const resetPackageForm = () => {
+    setPackageForm({ name: "", description: "", laborCost: "", active: true, parts: [] });
+    setEditingPackageId(null);
+    setShowPackageForm(false);
+  };
+
+  const openNewPackageForm = () => {
+    setPackageForm({ name: "", description: "", laborCost: "", active: true, parts: [] });
+    setEditingPackageId(null);
+    setShowPackageForm(true);
+  };
+
+  const openEditPackageForm = (pkg) => {
+    setPackageForm({
+      name: pkg.name || "",
+      description: pkg.description || "",
+      laborCost: String(pkg.laborCost ?? 0),
+      active: pkg.active !== false,
+      parts: Array.isArray(pkg.parts) ? pkg.parts.map((part) => ({ ...part })) : [],
+    });
+    setEditingPackageId(pkg.id);
+    setShowPackageForm(true);
+  };
+
+  const togglePackagePart = (part, checked) => {
+    setPackageForm((previous) => {
+      const current = previous.parts.filter((item) => item.inventoryId !== part.id);
+      if (!checked) return { ...previous, parts: current };
+      return {
+        ...previous,
+        parts: [...current, {
+          inventoryId: part.id,
+          name: part.name,
+          price: Number(part.price || 0),
+          required: true,
+          allowCustomerRemove: false,
+          safetyNotes: part.safetyNotes || "",
+        }],
+      };
+    });
+  };
+
+  const updatePackagePart = (inventoryId, field, value) => {
+    setPackageForm((previous) => ({
+      ...previous,
+      parts: previous.parts.map((part) => part.inventoryId === inventoryId ? { ...part, [field]: value } : part),
+    }));
+  };
+
+  const handleSavePackage = async () => {
+    if (!packageForm.name.trim()) return alert("Enter a service package name.");
+    if (packageForm.laborCost === "" || !Number.isFinite(Number(packageForm.laborCost)) || Number(packageForm.laborCost) < 0) return alert("Enter a valid labor cost (0 or higher).");
+    try {
+      setPackageSaving(true);
+      const packageData = {
+        name: packageForm.name.trim(),
+        description: packageForm.description.trim(),
+        laborCost: Number(packageForm.laborCost),
+        active: Boolean(packageForm.active),
+        parts: packageForm.parts.map((part) => {
+          const livePart = inventory.find((item) => item.id === part.inventoryId);
+          return {
+            inventoryId: part.inventoryId,
+            name: livePart?.name || part.name,
+            price: Number(livePart?.price ?? part.price ?? 0),
+            required: Boolean(part.required),
+            allowCustomerRemove: Boolean(part.allowCustomerRemove) && !Boolean(part.required),
+            safetyNotes: livePart?.safetyNotes || part.safetyNotes || "",
+          };
+        }),
+        updatedAt: serverTimestamp(),
+      };
+      if (editingPackageId) {
+        await updateDoc(doc(db, "servicePackages", editingPackageId), packageData);
+      } else {
+        const packageRef = doc(collection(db, "servicePackages"));
+        await setDoc(packageRef, { ...packageData, createdAt: serverTimestamp() });
+      }
+      resetPackageForm();
+    } catch (error) {
+      console.error("Error saving service package:", error);
+      alert(error?.message || "Failed to save service package.");
+    } finally {
+      setPackageSaving(false);
+    }
+  };
+
+  const handleDeletePackage = async (pkg) => {
+    if (!window.confirm(`Delete service package "${pkg.name}"? This cannot be undone.`)) return;
+    try {
+      await deleteDoc(doc(db, "servicePackages", pkg.id));
+    } catch (error) {
+      console.error("Error deleting service package:", error);
+      alert(error?.message || "Failed to delete service package.");
+    }
+  };
 
   const handleCategoryChange = (category) => {
     setFormData((prev) => ({
@@ -703,6 +831,12 @@ function AdminInventory() {
         </div>
       </div>
 
+      <div className="flex gap-2 p-1 bg-gray-100 rounded-xl mb-6 max-w-md">
+        <button onClick={() => setActiveTab("parts")} className={`flex-1 rounded-lg px-4 py-2.5 text-sm font-semibold transition-colors ${activeTab === "parts" ? "bg-white text-gray-900 shadow-sm" : "text-gray-500 hover:text-gray-800"}`}><Package size={15} className="inline mr-2" />Parts Inventory</button>
+        <button onClick={() => setActiveTab("packages")} className={`flex-1 rounded-lg px-4 py-2.5 text-sm font-semibold transition-colors ${activeTab === "packages" ? "bg-white text-gray-900 shadow-sm" : "text-gray-500 hover:text-gray-800"}`}><Wrench size={15} className="inline mr-2" />Service Packages</button>
+      </div>
+
+      {activeTab === "parts" && (<>
       {firestoreError && (
         <div className="bg-red-50 border border-red-200 text-red-700 rounded-xl p-4 mb-6 text-sm">
           <strong>Firestore Error:</strong> {firestoreError}
@@ -1046,6 +1180,44 @@ function AdminInventory() {
           );
         })}
       </div>
+
+      </>)}
+
+      {activeTab === "packages" && (
+        <div className="space-y-5">
+          <div className="bg-white border border-gray-100 rounded-xl p-5 sm:p-6 shadow-sm flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+            <div><h2 className="text-lg font-semibold text-gray-900">Service Package</h2><p className="text-sm text-gray-500 mt-1">Set labor costs and select parts from your existing inventory. Prices are synced from inventory when saving.</p></div>
+            <button onClick={openNewPackageForm} className="inline-flex items-center justify-center gap-2 px-4 py-2.5 bg-[#0a0f1a] text-white rounded-lg text-sm font-medium hover:bg-slate-800"><Plus size={16}/> Create Package</button>
+          </div>
+
+          {packageLoading ? <div className="bg-white rounded-xl border p-6 text-sm text-gray-500">Loading service packages...</div> : servicePackages.length === 0 ? (
+            <div className="bg-white rounded-xl border border-dashed border-gray-300 p-10 text-center"><Wrench size={28} className="mx-auto text-gray-300 mb-3"/><h3 className="font-semibold text-gray-800">No service packages yet</h3><p className="text-sm text-gray-500 mt-1">Create your first package, such as Complete PMS or CVT Cleaning.</p></div>
+          ) : (
+            <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+              {servicePackages.map((pkg) => {
+                const partTotal = (pkg.parts || []).reduce((sum, part) => sum + Number(part.price || 0), 0);
+                return <div key={pkg.id} className="bg-white border border-gray-100 rounded-xl p-5 shadow-sm">
+                  <div className="flex items-start justify-between gap-3"><div className="min-w-0"><h3 className="font-semibold text-gray-900">{pkg.name}</h3><p className="text-sm text-gray-500 mt-1">{pkg.description || "No description provided."}</p></div><span className={`shrink-0 text-xs font-semibold px-2.5 py-1 rounded-full ${pkg.active !== false ? "bg-green-50 text-green-700" : "bg-gray-100 text-gray-500"}`}>{pkg.active !== false ? "Active" : "Inactive"}</span></div>
+                  <div className="grid grid-cols-2 gap-3 my-4"><div className="bg-gray-50 rounded-lg p-3"><p className="text-xs text-gray-500">Labor</p><p className="font-semibold text-gray-900">₱{Number(pkg.laborCost || 0).toLocaleString()}</p></div><div className="bg-gray-50 rounded-lg p-3"><p className="text-xs text-gray-500">Parts estimate</p><p className="font-semibold text-gray-900">₱{partTotal.toLocaleString()}</p></div></div>
+                  <div className="border-t border-gray-100 pt-3"><p className="text-xs uppercase tracking-wide font-semibold text-gray-400 mb-2">Included parts ({(pkg.parts || []).length})</p>{(pkg.parts || []).length ? <div className="space-y-2">{pkg.parts.map((part) => <div key={part.inventoryId} className="flex items-start justify-between gap-3 text-sm"><span className="text-gray-700">{part.name}<span className="block text-xs text-gray-400">{part.required ? "Required" : "Optional"}{part.allowCustomerRemove ? " · Customer may remove" : ""}</span>{part.safetyNotes ? <span className="block text-xs text-amber-700">Safety note: {part.safetyNotes}</span> : null}</span><span className="font-medium text-gray-800 shrink-0">₱{Number(part.price || 0).toLocaleString()}</span></div>)}</div> : <p className="text-sm text-gray-400">No parts selected.</p>}</div>
+                  <div className="flex items-center justify-between gap-3 mt-4 pt-4 border-t border-gray-100"><p className="text-sm text-gray-500">Estimated base total <strong className="text-gray-900">₱{(Number(pkg.laborCost || 0) + partTotal).toLocaleString()}</strong></p><div className="flex gap-2"><button onClick={() => openEditPackageForm(pkg)} className="p-2 rounded-lg border border-gray-200 hover:bg-gray-50 text-gray-600" title="Edit package"><Edit size={15}/></button><button onClick={() => handleDeletePackage(pkg)} className="p-2 rounded-lg border border-red-100 hover:bg-red-50 text-red-500" title="Delete package"><Trash2 size={15}/></button></div></div>
+                </div>;
+              })}
+            </div>
+          )}
+
+          {showPackageForm && <div className="fixed inset-0 z-[60] bg-slate-950/60 backdrop-blur-sm flex items-center justify-center p-3 sm:p-5 overflow-y-auto"><div className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[calc(100vh-2rem)] overflow-y-auto my-auto"><div className="sticky top-0 bg-white border-b border-gray-100 p-5 flex items-center justify-between gap-3 z-10"><div><p className="text-xs uppercase tracking-wider text-gray-400">Inventory / Service Packages</p><h3 className="text-lg font-semibold text-gray-900">{editingPackageId ? "Edit Service Package" : "Create Service Package"}</h3></div><button onClick={resetPackageForm} className="p-2 rounded-lg hover:bg-gray-100"><X size={18}/></button></div>
+            <div className="p-5 space-y-5"><div className="grid grid-cols-1 sm:grid-cols-2 gap-4"><div><label className="block text-xs font-semibold text-gray-500 mb-1.5">Package Name *</label><input value={packageForm.name} onChange={(e) => setPackageForm({...packageForm,name:e.target.value})} placeholder="e.g. Complete PMS" className="w-full px-3 py-2.5 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-gray-300"/></div><div><label className="block text-xs font-semibold text-gray-500 mb-1.5">Labor Cost (₱) *</label><input type="number" min="0" value={packageForm.laborCost} onChange={(e) => setPackageForm({...packageForm,laborCost:e.target.value})} placeholder="0.00" className="w-full px-3 py-2.5 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-gray-300"/></div></div>
+            <div><label className="block text-xs font-semibold text-gray-500 mb-1.5">Description</label><textarea rows={2} value={packageForm.description} onChange={(e) => setPackageForm({...packageForm,description:e.target.value})} placeholder="Describe what this service package covers" className="w-full px-3 py-2.5 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-gray-300"/></div>
+            <label className="inline-flex items-center gap-2 text-sm text-gray-700"><input type="checkbox" checked={packageForm.active} onChange={(e) => setPackageForm({...packageForm,active:e.target.checked})} className="rounded border-gray-300"/> Available to customers</label>
+            <div><div className="flex items-center justify-between gap-3 mb-2"><div><h4 className="font-semibold text-gray-900 text-sm">Package Parts</h4><p className="text-xs text-gray-500 mt-0.5">Select parts from inventory. Required items cannot be removed by customers.</p></div><span className="text-xs text-gray-500">{packageForm.parts.length} selected</span></div>
+              <div className="border border-gray-200 rounded-xl divide-y divide-gray-100 max-h-72 overflow-y-auto">{inventory.length === 0 ? <p className="p-4 text-sm text-gray-500">Add parts to inventory first.</p> : inventory.map((part) => { const selected = packageForm.parts.some((item) => item.inventoryId === part.id); const selectedPart = packageForm.parts.find((item) => item.inventoryId === part.id); return <div key={part.id} className="p-3 sm:p-4"><label className="flex items-start gap-3 cursor-pointer"><input type="checkbox" checked={selected} onChange={(e) => togglePackagePart(part,e.target.checked)} className="mt-1 rounded border-gray-300"/><span className="flex-1 min-w-0"><span className="block text-sm font-medium text-gray-800">{part.name}</span><span className="block text-xs text-gray-500">Inventory price: ₱{Number(part.price || 0).toLocaleString()} · Stock: {Number(part.quantity || 0)}</span>{part.safetyNotes ? <span className="block text-xs text-amber-700 mt-1">Safety note: {part.safetyNotes}</span> : null}</span></label>
+                {selected && <div className="ml-7 mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3"><label className="flex items-center gap-2 text-xs text-gray-600"><input type="checkbox" checked={Boolean(selectedPart?.required)} onChange={(e) => updatePackagePart(part.id,"required",e.target.checked)} /> Required replacement</label><label className="flex items-center gap-2 text-xs text-gray-600"><input type="checkbox" checked={Boolean(selectedPart?.allowCustomerRemove) && !selectedPart?.required} disabled={Boolean(selectedPart?.required)} onChange={(e) => updatePackagePart(part.id,"allowCustomerRemove",e.target.checked)} /> Customer may remove if not needed</label></div>}</div>;})}</div>
+            </div>
+            <div className="rounded-xl bg-gray-50 border border-gray-100 p-4 flex items-center justify-between gap-3"><div><p className="text-xs text-gray-500">Estimated package total</p><p className="text-xl font-bold text-gray-900">₱{(Number(packageForm.laborCost || 0) + packageForm.parts.reduce((sum,part) => { const live = inventory.find((item) => item.id === part.inventoryId); return sum + Number(live?.price ?? part.price ?? 0); },0)).toLocaleString()}</p></div><p className="text-xs text-gray-500 max-w-xs">Estimate uses labor cost and current inventory prices. Final price may require shop confirmation.</p></div>
+            </div><div className="sticky bottom-0 bg-white border-t border-gray-100 p-4 sm:p-5 flex justify-end gap-3"><button onClick={resetPackageForm} disabled={packageSaving} className="px-4 py-2.5 rounded-lg bg-gray-100 text-gray-700 text-sm">Cancel</button><button onClick={handleSavePackage} disabled={packageSaving} className="inline-flex items-center gap-2 px-5 py-2.5 rounded-lg bg-[#0a0f1a] text-white text-sm font-medium disabled:opacity-50"><Save size={15}/>{packageSaving ? "Saving..." : editingPackageId ? "Save Changes" : "Create Package"}</button></div></div></div>}
+        </div>
+      )}
 
       {showModal && (
         <div className="fixed inset-0 bg-slate-950/55 backdrop-blur-sm flex items-center justify-center z-50 p-3 sm:p-4 overflow-y-auto">
