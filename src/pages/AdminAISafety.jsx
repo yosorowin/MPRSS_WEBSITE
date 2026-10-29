@@ -46,7 +46,16 @@ export default function AdminAISafety() {
         const data = snapshot.docs.map((alertDoc) => ({
           id: alertDoc.id,
           ...alertDoc.data(),
-        }));
+        })).sort((a, b) => {
+          const getMillis = (value) => {
+            if (!value) return 0;
+            if (typeof value.toMillis === "function") return value.toMillis();
+            if (value.seconds) return value.seconds * 1000;
+            const parsed = new Date(value).getTime();
+            return Number.isFinite(parsed) ? parsed : 0;
+          };
+          return getMillis(b.createdAt) - getMillis(a.createdAt);
+        });
 
         setAlerts(data);
         setLoading(false);
@@ -633,7 +642,7 @@ export default function AdminAISafety() {
               </p>
 
               <p className="text-sm text-gray-700 leading-relaxed">
-                {selectedAlert.aiRecommendation ||
+                {getAlertRecommendation(selectedAlert) ||
                   "No AI recommendation available."}
               </p>
 
@@ -711,6 +720,55 @@ export default function AdminAISafety() {
  * ============================================================
  */
 
+function getAlertRecommendation(alert) {
+  if (alert?.aiRecommendation) return alert.aiRecommendation;
+
+  const result = alert?.result || {};
+  const recommendations = Array.isArray(result.recommendations)
+    ? result.recommendations
+    : [];
+  const recommendationText = recommendations.map((item) => {
+    if (typeof item === "string") return item;
+    if (!item || typeof item !== "object") return "";
+    const title = item.partName || item.name || item.title || "";
+    const finding = item.finding || item.explanation || item.reason || "";
+    const actions = Array.isArray(item.recommendations)
+      ? item.recommendations.join("; ")
+      : item.recommendation || "";
+    return [title, finding, actions].filter(Boolean).join(": ");
+  }).filter(Boolean).join("\n");
+
+  const findings = Array.isArray(result.findings)
+    ? result.findings.map((item) =>
+        typeof item === "string" ? item : item?.message || item?.finding || item?.description || ""
+      ).filter(Boolean).join("\n")
+    : "";
+
+  return [
+    recommendationText,
+    findings,
+    result.aiRecommendation,
+    result.explanation,
+    result.summary,
+    result.analysis,
+    result.safetyAssessment,
+  ].filter((value) => typeof value === "string" && value.trim()).join("\n\n");
+}
+
+function ScoreValue({ label, value }) {
+  const hasValue = value !== null && value !== undefined && value !== "";
+  const numericValue = hasValue ? Number(String(value).replace("%", "").trim()) : NaN;
+
+  return (
+    <div className="rounded-lg bg-gray-50 px-3 py-2">
+      <p className="text-[10px] uppercase tracking-wider text-gray-400">{label}</p>
+      <p className="text-sm font-semibold text-gray-800">
+        {Number.isFinite(numericValue) ? `${Math.round(numericValue)}%` : "N/A"}
+      </p>
+    </div>
+  );
+}
+
 function AlertRow({
   alert,
   expanded,
@@ -739,8 +797,8 @@ function AlertRow({
 
               <span
                 className={`text-[10px] px-1.5 py-0.5 rounded font-semibold ${
-                  alert.riskLevel ===
-                  "DANGEROUS"
+                  String(alert.riskLevel || "").toLowerCase() ===
+                  "dangerous"
                     ? "bg-gray-900 text-white"
                     : "bg-gray-100 text-gray-600"
                 }`}
@@ -817,6 +875,36 @@ function AlertRow({
 
             </div>
 
+            {/* Evaluation Scores */}
+            {(alert.overallPercentage !== undefined ||
+              alert.compatibilityPercentage !== undefined ||
+              alert.safetyPercentage !== undefined) && (
+              <div>
+                <p className="text-[11px] text-gray-400 uppercase tracking-wider mb-1">
+                  AI Evaluation Scores
+                </p>
+                <div className="grid grid-cols-3 gap-2">
+                  <ScoreValue label="Overall" value={alert.overallPercentage ?? alert.result?.overallPercentage ?? alert.result?.overallScore} />
+                  <ScoreValue label="Compatibility" value={alert.compatibilityPercentage ?? alert.result?.compatibilityPercentage} />
+                  <ScoreValue label="Safety" value={alert.safetyPercentage ?? alert.result?.safetyPercentage} />
+                </div>
+              </div>
+            )}
+
+            {/* Selected Parts */}
+            {Array.isArray(alert.selectedParts) && alert.selectedParts.length > 0 && (
+              <div>
+                <p className="text-[11px] text-gray-400 uppercase tracking-wider mb-1">
+                  Selected Parts
+                </p>
+                <p className="text-sm text-gray-700 bg-gray-50 px-3 py-2 rounded-lg">
+                  {alert.selectedParts.map((part) =>
+                    typeof part === "string" ? part : part?.name || part?.partName || ""
+                  ).filter(Boolean).join(", ") || "N/A"}
+                </p>
+              </div>
+            )}
+
             {/* AI Recommendation */}
             <div>
 
@@ -825,7 +913,7 @@ function AlertRow({
               </p>
 
               <p className="text-sm text-gray-700 bg-gray-50 px-3 py-2 rounded-lg leading-relaxed">
-                {alert.aiRecommendation ||
+                {getAlertRecommendation(alert) ||
                   "No recommendation available."}
               </p>
 

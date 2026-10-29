@@ -7,6 +7,7 @@ import {
   Check,
   Printer,
   Play,
+  CreditCard,
 } from "lucide-react";
 import {
   addDoc,
@@ -57,20 +58,6 @@ const notifyServiceLifecycle = async (service, title, message, status) => {
 // ============================================================
 // OPTIONS
 // ============================================================
-
-const estimatedCostOptions = [
-  100,
-  200,
-  300,
-  400,
-  500,
-  750,
-  1000,
-  1500,
-  2000,
-  2500,
-  3000,
-];
 
 const estimatedTimeOptions = [
   "30 minutes",
@@ -135,33 +122,37 @@ const formatMotorcycle = (motorcycle) => {
   return result || motorcycle.name || motorcycle.motorcycleName || "—";
 };
 
-const getCustomer = (service, users) => {
-  if (service.customerName) return service.customerName;
-
+const getCustomer = (service, users, customers) => {
   const customerId =
     service.customerId ||
+    service.customerUid ||
     service.userId ||
+    service.user?.uid ||
     service.user?.id ||
+    service.customer?.uid ||
     service.customer?.id;
 
-  const customer = users.find(
+  // The customer mobile profile is stored in `customers`; older accounts may
+  // also have a matching document in `users`.
+  const customer = [...(customers || []), ...(users || [])].find(
     (user) => user.id === customerId || user.uid === customerId
   );
 
-  if (!customer) {
-    return (
-      service.customer?.name ||
-      service.user?.name ||
-      service.customerEmail ||
-      "Unknown Customer"
-    );
+  if (customer) {
+    const registeredName =
+      customer.fullName ||
+      customer.name ||
+      customer.displayName ||
+      `${customer.firstName || ""} ${customer.lastName || ""}`.trim();
+    if (registeredName) return registeredName;
   }
 
   return (
-    customer.fullName ||
-    customer.name ||
-    `${customer.firstName || ""} ${customer.lastName || ""}`.trim() ||
-    customer.email ||
+    service.customerName ||
+    service.customer?.name ||
+    service.user?.name ||
+    service.customerEmail ||
+    customer?.email ||
     "Unknown Customer"
   );
 };
@@ -188,39 +179,236 @@ const getMotorcycle = (service, motorcycles) => {
   return motorcycle ? formatMotorcycle(motorcycle) : "—";
 };
 
-const enrichService = (service, users, motorcycles) => ({
-  ...service,
 
-  customerName: getCustomer(service, users),
+const ORIGINAL_PART_LABELS = {
+  engineBlock: "Engine / Cylinder Block",
+  ecu: "ECU",
+  throttleBody: "Throttle Body",
+  fuelInjector: "Fuel Injector",
+  camshaft: "Camshaft",
+  exhaust: "Exhaust System",
+  transmission: "CVT / Transmission",
+  suspension: "Suspension",
+  brakes: "Brakes",
+  tires: "Tires",
+};
 
-  motorcycleDisplay: getMotorcycle(service, motorcycles),
+const getOriginalPartsSnapshot = (service, motorcycles = []) => {
+  // Prefer the request-time snapshot so later motorcycle profile edits do not
+  // change the declaration that was submitted with this service request.
+  if (Array.isArray(service?.originalPartsSnapshot) && service.originalPartsSnapshot.length) {
+    return service.originalPartsSnapshot;
+  }
 
-  requestDate:
-    service.requestDate ||
-    service.createdAt ||
-    service.dateRequested,
+  // Backward-compatible fallback for older requests that did not save a snapshot.
+  const motorcycleId = service?.motorcycleId || service?.motorcycleID || service?.vehicleId;
+  const motorcycle = motorcycles.find(
+    (item) => item.id === motorcycleId || item.motorcycleId === motorcycleId
+  );
+  const declaredParts =
+    service?.motorcycleOriginalParts ||
+    motorcycle?.originalParts ||
+    (service?.motorcycle && typeof service.motorcycle === "object" ? service.motorcycle.originalParts : null) ||
+    {};
 
-  preferredDate:
-    service.preferredDate ||
-    service.scheduleDate ||
-    service.serviceDate,
+  return Object.entries(ORIGINAL_PART_LABELS).map(([key, partName]) => {
+    const declaration = declaredParts[key] || {};
+    return {
+      key,
+      partName,
+      declaredStatus: declaration.status || "Unknown",
+      details: declaration.details || "",
+    };
+  });
+};
 
-  preferredTime:
-    service.preferredTime ||
-    service.scheduleTime ||
-    service.serviceTime,
+const normalizePartName = (value) => String(value || "")
+  .toLowerCase()
+  .replace(/&/g, " and ")
+  .replace(/[^a-z0-9]+/g, " ")
+  .trim()
+  .replace(/\s+/g, " ");
 
-  displayStatus:
-    service.status ||
-    service.approvalStatus ||
-    "Pending",
+const parseServiceMoney = (value) => {
+  if (value === null || value === undefined || value === "") return null;
+  if (typeof value === "object") {
+    for (const key of ["amount", "value", "price", "total", "estimatedCost", "partsSubtotal", "unitPrice", "sellingPrice"]) {
+      const parsed = parseServiceMoney(value[key]);
+      if (parsed !== null) return parsed;
+    }
+    return null;
+  }
+  // Also accepts formatted prices such as "PHP 1,250.00" and "₱1,250".
+  const match = String(value).replace(/,/g, "").match(/-?\d+(?:\.\d+)?/);
+  if (!match) return null;
+  const parsed = Number(match[0]);
+  return Number.isFinite(parsed) ? parsed : null;
+};
 
-  displayCost:
-    service.estimatedCost ??
-    service.cost ??
-    service.totalCost ??
-    0,
-});
+const getPartPrice = (part) => {
+  if (!part || typeof part !== "object") return null;
+  const keys = [
+    "price", "unitPrice", "sellingPrice", "retailPrice", "estimatedPrice", "amount",
+    "unit_price", "selling_price", "retail_price", "priceAmount", "priceValue",
+    "srp", "suggestedRetailPrice", "costPrice", "unitCost", "costPerUnit", "currentPrice",
+  ];
+  for (const key of keys) {
+    const parsed = parseServiceMoney(part[key]);
+    // A zero price is usually an unset inventory value. Check all aliases for
+    // a real price before treating the part as unpriced.
+    if (parsed !== null && parsed > 0) return parsed;
+  }
+  return null;
+};
+
+const getAIRequestedParts = (service, inventory = []) => {
+  if (!service) return [];
+  const aiResult = service.aiResult || service.aiAnalysisResult || service.result || {};
+  const candidates = [
+    service.requestedParts,
+    service.aiRequestedParts,
+    service.partsRequested,
+    service.aiParts,
+    String(service.aiMode || service.mode || "").toLowerCase() === "recommendation" ? service.recommendedParts : service.selectedParts,
+    service.recommendedParts,
+    service.selectedParts,
+    aiResult?.requestedParts,
+    aiResult?.aiRequestedParts,
+    aiResult?.recommendedParts,
+    aiResult?.selectedParts,
+    aiResult?.suggestions,
+    aiResult?.parts,
+  ];
+  const normalize = (value, index) => {
+    if (typeof value === "string") {
+      const name = value.trim();
+      if (!name) return null;
+      const normalizedName = normalizePartName(name);
+      const inventoryPart = (inventory || []).find((item) => normalizedName && normalizePartName(item.name || item.partName || item.title) === normalizedName);
+      const price = getPartPrice(inventoryPart);
+      return { id: inventoryPart?.id || name, name, price, unitPrice: price, quantity: 1 };
+    }
+    if (!value || typeof value !== "object") return null;
+    const nested = value.part && typeof value.part === "object" ? value.part : value;
+    const name = nested.name || nested.partName || nested.title || nested.label || nested.description;
+    if (!name) return null;
+    const candidateId = nested.id || nested.partId || nested.inventoryId;
+    const normalizedName = normalizePartName(name);
+    const inventoryPart = (inventory || []).find((item) =>
+      (candidateId && [item.id, item.partId, item.inventoryId].some((id) => id && String(id) === String(candidateId))) ||
+      (normalizedName && normalizePartName(item.name || item.partName || item.title) === normalizedName)
+    );
+    const price = getPartPrice(nested) ?? getPartPrice(inventoryPart);
+    return {
+      ...nested,
+      id: candidateId || inventoryPart?.id || `ai-part-${index}-${String(name)}`,
+      name: String(name),
+      price,
+      unitPrice: price,
+      quantity: Number(nested.quantity) > 0 ? Number(nested.quantity) : 1,
+    };
+  };
+  for (const candidate of candidates) {
+    if (!Array.isArray(candidate) || !candidate.length) continue;
+    const normalized = candidate.map(normalize).filter(Boolean);
+    if (normalized.length) return normalized;
+  }
+  return [];
+};
+
+const getServiceEstimatedCost = (service, inventory = []) => {
+  if (!service) return null;
+  const aiResult = service.aiResult || service.aiAnalysisResult || service.result || {};
+  const candidates = [
+    service.estimatedCost,
+    service.estimatedPartsCost,
+    service.aiEstimatedCost,
+    service.aiEstimatedPartsCost,
+    service.partsCostEstimate,
+    service.partsEstimate,
+    service.displayCost,
+    service.itemizedEstimate?.partsSubtotal,
+    service.itemizedEstimate?.total,
+    service.cost,
+    service.totalCost,
+    aiResult?.estimatedPartsCost,
+    aiResult?.estimatedCost,
+    aiResult?.partsEstimate,
+    aiResult?.costEstimate,
+    aiResult?.totalEstimatedCost,
+    aiResult?.estimatedTotal,
+    aiResult?.pricing?.partsSubtotal,
+    aiResult?.pricing?.total,
+    aiResult?.costBreakdown?.partsSubtotal,
+    aiResult?.costBreakdown?.total,
+    aiResult?.itemizedEstimate?.partsSubtotal,
+    aiResult?.itemizedEstimate?.total,
+  ];
+  const numeric = candidates.map(parseServiceMoney).filter((value) => value !== null);
+  // Ignore a saved 0 placeholder if the actual request parts can supply prices.
+  const declared = numeric.find((value) => value > 0);
+  if (declared !== undefined) return declared;
+  const parts = getAIRequestedParts(service, inventory);
+  const priced = parts.filter((part) => part.price !== null && Number.isFinite(Number(part.price)) && Number(part.price) > 0);
+  if (priced.length) return priced.reduce((sum, part) => sum + Number(part.price) * (Number(part.quantity) > 0 ? Number(part.quantity) : 1), 0);
+  return service.requestSource === "AI Assistant" ? null : (numeric[0] ?? null);
+};
+
+const isAIServiceRequest = (service) => {
+  if (!service) return false;
+  const requestSource = String(
+    service.requestSource || service.requestOrigin || service.source || ""
+  ).trim().toLowerCase();
+  const aiMode = String(service.aiMode || "").trim().toLowerCase();
+  const aiResultValue = service.aiResult || service.aiAnalysisResult || service.result || null;
+  const resultMode = String(aiResultValue?.type || aiResultValue?.mode || "").trim().toLowerCase();
+  return requestSource === "ai assistant" ||
+    service.isAIRequest === true ||
+    service.createdFromAI === true ||
+    ["evaluation", "recommendation"].includes(aiMode) ||
+    ["evaluation", "recommendation"].includes(resultMode);
+};
+
+const enrichService = (service, users, motorcycles, customers, inventory = []) => {
+  const aiRequestedParts = getAIRequestedParts(service, inventory);
+  // Having requested/package parts does not by itself make a service an AI request.
+  const hasAiRequest = isAIServiceRequest(service);
+  const hasUnpricedPart = aiRequestedParts.some((part) => part.price === null || part.price === undefined || Number(part.price) <= 0);
+  const estimatedCost = getServiceEstimatedCost(service, inventory);
+  return {
+    ...service,
+    // Keep the AI-requested parts separate from parts actually installed.
+    // Resolve prices from live inventory when older request records omitted them.
+    requestedParts: aiRequestedParts.length ? aiRequestedParts : service.requestedParts,
+    estimatedCost,
+    estimateAvailable: hasAiRequest && aiRequestedParts.length
+      ? !hasUnpricedPart
+      : service.estimateAvailable,
+    customerName: getCustomer(service, users, customers),
+    motorcycleDisplay: getMotorcycle(service, motorcycles),
+    requestDate:
+      service.requestDate ||
+      service.createdAt ||
+      service.dateRequested,
+    preferredDate:
+      service.preferredDate ||
+      service.scheduleDate ||
+      service.serviceDate,
+    preferredTime:
+      service.preferredTime ||
+      service.scheduleTime ||
+      service.serviceTime,
+    displayStatus:
+      service.status ||
+      service.approvalStatus ||
+      "Pending",
+    displayCost:
+      estimatedCost ??
+      service.cost ??
+      service.totalCost ??
+      null,
+  };
+};
 
 const getDisplayStatus = (service) => {
   const status = normalizeStatus(service.status);
@@ -317,6 +505,7 @@ const getInventoryStockField = (part) => {
 
 const AdminServices = () => {
   const [users, setUsers] = useState([]);
+  const [customers, setCustomers] = useState([]);
   const [staff, setStaff] = useState([]);
   const [motorcycles, setMotorcycles] = useState([]);
   const [services, setServices] = useState([]);
@@ -328,7 +517,6 @@ const AdminServices = () => {
   const [showApprovalModal, setShowApprovalModal] = useState(false);
   const [selectedService, setSelectedService] = useState(null);
 
-  const [estimatedCost, setEstimatedCost] = useState("");
   const [estimatedTime, setEstimatedTime] = useState("");
   const [assignedStaff, setAssignedStaff] = useState("");
   const [assignedStaffId, setAssignedStaffId] = useState("");
@@ -341,6 +529,11 @@ const AdminServices = () => {
   const [showStatusModal, setShowStatusModal] = useState(false);
   const [newStatus, setNewStatus] = useState("");
   const [completionCost, setCompletionCost] = useState("");
+
+  // Payment status modal for active service requests.
+  const [showPaymentStatusModal, setShowPaymentStatusModal] = useState(false);
+  const [newPaymentStatus, setNewPaymentStatus] = useState("Not Yet Paid");
+  const [savingPaymentStatus, setSavingPaymentStatus] = useState(false);
 
   // Selected inventory parts
   const [selectedParts, setSelectedParts] = useState({});
@@ -367,6 +560,22 @@ const AdminServices = () => {
       (error) => {
         console.error("Error loading users:", error);
         setUsers([]);
+      }
+    );
+
+    const unsubCustomers = onSnapshot(
+      collection(db, "customers"),
+      (snapshot) => {
+        setCustomers(
+          snapshot.docs.map((doc) => ({
+            id: doc.id,
+            ...doc.data(),
+          }))
+        );
+      },
+      (error) => {
+        console.error("Error loading customers:", error);
+        setCustomers([]);
       }
     );
 
@@ -438,6 +647,7 @@ const AdminServices = () => {
 
     return () => {
       unsubUsers();
+      unsubCustomers();
       unsubStaff();
       unsubMotorcycles();
       unsubServices();
@@ -451,9 +661,9 @@ const AdminServices = () => {
 
   const enrichedServices = useMemo(() => {
     return services.map((service) =>
-      enrichService(service, users, motorcycles)
+      enrichService(service, users, motorcycles, customers, inventory)
     );
-  }, [services, users, motorcycles]);
+  }, [services, users, motorcycles, customers, inventory]);
 
   // ============================================================
   // SERVICE LISTS
@@ -610,12 +820,6 @@ const AdminServices = () => {
   const handleApprove = (service) => {
     setSelectedService(service);
 
-    setEstimatedCost(
-      service.estimatedCost
-        ? String(service.estimatedCost)
-        : ""
-    );
-
     setEstimatedTime(service.estimatedTime || "");
 
     setAssignedStaffId(service.assignedStaffId || "");
@@ -660,11 +864,6 @@ const AdminServices = () => {
 
   const handleSaveApproval = async () => {
     if (!selectedService) return;
-
-    if (!estimatedCost) {
-      alert("Please select an estimated cost.");
-      return;
-    }
 
     if (!estimatedTime) {
       alert("Please select an estimated time.");
@@ -742,8 +941,6 @@ const AdminServices = () => {
             selectedStaff?.jobTitle ||
             "",
 
-          estimatedCost: Number(estimatedCost) || 0,
-
           estimatedTime: estimatedTime.trim(),
 
           approvedAt: serverTimestamp(),
@@ -762,7 +959,6 @@ const AdminServices = () => {
       setShowApprovalModal(false);
       setSelectedService(null);
 
-      setEstimatedCost("");
       setEstimatedTime("");
       setAssignedStaff("");
       setAssignedStaffId("");
@@ -846,6 +1042,53 @@ const AdminServices = () => {
       );
 
       alert("Failed to approve payment method.");
+    }
+  };
+
+  // ============================================================
+  // PAYMENT STATUS UPDATE
+  // ============================================================
+
+  const handleOpenPaymentStatusModal = (service) => {
+    setSelectedService(service);
+    setNewPaymentStatus(service.paymentStatus || "Not Yet Paid");
+    setSavingPaymentStatus(false);
+    setShowPaymentStatusModal(true);
+  };
+
+  const handleSavePaymentStatus = async () => {
+    if (!selectedService || savingPaymentStatus) return;
+
+    const allowedPaymentStatuses = ["Not Yet Paid", "Partially Paid", "Paid"];
+    if (!allowedPaymentStatuses.includes(newPaymentStatus)) {
+      alert("Please select a valid payment status.");
+      return;
+    }
+
+    setSavingPaymentStatus(true);
+    try {
+      await updateDoc(doc(db, "services", selectedService.id), {
+        paymentStatus: newPaymentStatus,
+        paymentStatusUpdatedAt: serverTimestamp(),
+        paymentStatusUpdatedBy: "admin",
+        ...(newPaymentStatus === "Paid" ? { paymentReceivedAt: serverTimestamp() } : {}),
+        updatedAt: serverTimestamp(),
+      });
+
+      await notifyServiceLifecycle(
+        selectedService,
+        "Payment Status Updated",
+        `Your service payment status has been updated to ${newPaymentStatus}.`,
+        selectedService.status || "In Progress"
+      );
+
+      setShowPaymentStatusModal(false);
+      setSelectedService(null);
+    } catch (error) {
+      console.error("Error updating payment status:", error);
+      alert(error?.message || "Failed to update payment status.");
+    } finally {
+      setSavingPaymentStatus(false);
     }
   };
 
@@ -1373,7 +1616,8 @@ const AdminServices = () => {
                 <tbody>${partsRows}</tbody>
               </table>
               <div class="totals">
-                <div class="total-line"><span>Estimated Cost</span><strong>${money(service.estimatedCost)}</strong></div>
+                <div class="total-line"><span>Estimated Cost${service.estimateAvailable === false ? " (Partial)" : ""}</span><strong>${money(service.estimatedCost)}</strong></div>
+                ${service.estimateAvailable === false && service.estimateNote ? `<div class="muted small">${escapeHtml(service.estimateNote)}</div>` : ""}
                 ${completed ? `<div class="total-line"><span>Final Service Cost</span><strong>${money(service.cost)}</strong></div>` : ""}
                 <div class="total-line grand"><span>${completed ? "Total" : "Estimated Total"}</span><span>${money(amountDue)}</span></div>
               </div>
@@ -1549,12 +1793,16 @@ const AdminServices = () => {
                 </p>
 
                 <p className="text-sm font-semibold text-gray-900">
-                  {service.estimatedCost
-                    ? `₱${Number(
-                        service.estimatedCost
-                      ).toLocaleString()}`
+                  {service.estimatedCost !== undefined &&
+                  service.estimatedCost !== null &&
+                  service.estimatedCost !== "" &&
+                  Number.isFinite(Number(service.estimatedCost))
+                    ? `₱${Number(service.estimatedCost).toLocaleString()}${service.estimateAvailable === false ? " (Partial)" : ""}`
                     : "—"}
                 </p>
+                {service.estimateAvailable === false && service.estimateNote ? (
+                  <p className="text-xs text-gray-500 mt-1">{service.estimateNote}</p>
+                ) : null}
               </div>
 
               <div>
@@ -1578,6 +1826,156 @@ const AdminServices = () => {
                 </p>
               </div>
             </div>
+
+            {/* Original manufacturer-installed parts declaration from the customer motorcycle profile. */}
+            {(() => {
+              const originalParts = getOriginalPartsSnapshot(service, motorcycles);
+              const hasSavedDeclaration =
+                (Array.isArray(service.originalPartsSnapshot) && service.originalPartsSnapshot.length > 0) ||
+                Object.keys(service.motorcycleOriginalParts || {}).length > 0 ||
+                Object.keys(motorcycles.find((item) =>
+                  item.id === (service.motorcycleId || service.motorcycleID || service.vehicleId) ||
+                  item.motorcycleId === (service.motorcycleId || service.motorcycleID || service.vehicleId)
+                )?.originalParts || {}).length > 0;
+
+              return (
+                <div className="mt-6 p-4 bg-amber-50 rounded-lg border border-amber-100">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-amber-800 mb-2">
+                    Original Manufacturer-Installed Parts
+                  </p>
+                  <p className="text-xs text-amber-900 mb-3">
+                    {hasSavedDeclaration
+                      ? "Customer-declared condition at the time of the service request."
+                      : "No original parts declaration was saved with this request."}
+                  </p>
+                  {hasSavedDeclaration ? (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-5 gap-y-3">
+                      {originalParts.map((part, index) => (
+                        <div key={`${service.id}-original-part-${part.key || index}`} className="min-w-0">
+                          <p className="text-xs font-semibold text-gray-600">{part.partName || part.label || part.key || "Part"}</p>
+                          <p className="text-sm font-semibold text-gray-900">
+                            {part.declaredStatus || part.status || "Unknown"}
+                          </p>
+                          {(part.details || part.note) ? (
+                            <p className="text-xs text-gray-600 whitespace-pre-wrap">{part.details || part.note}</p>
+                          ) : null}
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              );
+            })()}
+
+            {/* Requested parts are shown for ALL service requests. Only AI-origin
+                requests receive the AI-specific heading and analysis sections. */}
+            {(() => {
+              const isAIRequest = isAIServiceRequest(service);
+              const aiRequestedParts = getAIRequestedParts(service, inventory);
+              const aiResultValue = service.aiResult || service.aiAnalysisResult || service.result || null;
+              const aiMode = String(service.aiMode || aiResultValue?.type || aiResultValue?.mode || "").trim().toLowerCase();
+              const hasRequestedParts = aiRequestedParts.length > 0;
+
+              if (!isAIRequest && !hasRequestedParts) return null;
+
+              const aiResultText = typeof aiResultValue === "string"
+                ? aiResultValue
+                : [
+                    aiResultValue?.summary,
+                    typeof aiResultValue?.analysis === "string" ? aiResultValue.analysis : "",
+                    typeof aiResultValue?.recommendation === "string" ? aiResultValue.recommendation : "",
+                    aiResultValue?.explanation,
+                  ].find((value) => typeof value === "string" && value.trim()) || "";
+              const aiSuggestionSource = Array.isArray(aiResultValue?.suggestions)
+                ? aiResultValue.suggestions
+                : Array.isArray(aiResultValue?.recommendations)
+                ? aiResultValue.recommendations
+                : [];
+              const requestedPartNames = new Set(aiRequestedParts.map((part) => String(part.name || "").trim().toLowerCase()));
+              const isPlaceholderFinding = (value) => /^(ai finding|ai findings|finding|findings|recommendation|n\/?a|none)$/i.test(String(value || "").trim());
+              const aiSuggestionList = isAIRequest ? aiSuggestionSource.map((item) => {
+                if (typeof item === "string") {
+                  const text = item.trim();
+                  return text && !requestedPartNames.has(text.toLowerCase()) && !isPlaceholderFinding(text)
+                    ? { text }
+                    : null;
+                }
+                if (!item || typeof item !== "object") return null;
+                const partName = item.partName || item.name || item.title || item.category || "";
+                const finding = item.finding || item.explanation || item.reason || item.recommendation || item.description || item.summary || item.text || "";
+                // Do not repeat the part list under AI Findings/Recommendations.
+                if (!finding || isPlaceholderFinding(finding)) return null;
+                const text = [partName, finding].filter(Boolean).join(partName && finding ? ": " : "");
+                return text ? { text } : null;
+              }).filter(Boolean) : [];
+              const aiModeLabel = aiMode === "evaluation"
+                ? "Evaluation Result"
+                : aiMode === "recommendation"
+                ? "Recommendation Result"
+                : "AI Assistant Result";
+              const partsHeading = isAIRequest
+                ? (aiMode === "recommendation" ? "Recommended Parts" : "Selected Parts")
+                : "Requested Parts";
+              const containerClass = isAIRequest
+                ? "mt-6 p-4 bg-blue-50 rounded-lg border border-blue-100"
+                : "mt-6 p-4 bg-gray-50 rounded-lg border border-gray-200";
+              const headingClass = isAIRequest
+                ? "text-xs font-semibold uppercase tracking-wide text-blue-700 mb-2"
+                : "text-xs font-semibold uppercase tracking-wide text-gray-600 mb-2";
+
+              return (
+                <div className={containerClass}>
+                  <p className={headingClass}>
+                    {isAIRequest ? "AI Assistant Request Details" : "Service Request Details"}
+                  </p>
+
+                  {hasRequestedParts && (
+                    <div className="mb-3">
+                      <p className="text-xs font-semibold text-gray-700 mb-1">{partsHeading}</p>
+                      <ul className="list-disc pl-5 space-y-1">
+                        {aiRequestedParts.map((part, index) => (
+                          <li key={`${service.id}-requested-part-${index}`} className="text-sm text-gray-800">
+                            {typeof part === "string" ? part : (part?.name || part?.partName || part?.title || "Unnamed Part")}
+                            {part && typeof part === "object" && part.brand ? ` • ${part.brand}` : ""}
+                            {part && typeof part === "object" && part.price !== null && part.price !== undefined && part.price !== "" && Number.isFinite(Number(part.price)) && Number(part.price) > 0 ? ` — ₱${Number(part.price).toLocaleString("en-PH")}` : ""}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+
+                  {isAIRequest && aiResultText && (
+                    <div>
+                      <p className="text-xs font-semibold text-gray-700 mb-1">{aiModeLabel}</p>
+                      <p className="text-sm text-gray-700 leading-relaxed whitespace-pre-wrap">{aiResultText}</p>
+                    </div>
+                  )}
+
+                  {isAIRequest && aiSuggestionList.length > 0 && (
+                    <div className="mt-3">
+                      <p className="text-xs font-semibold text-gray-700 mb-1">
+                        {aiMode === "recommendation" ? "AI Recommendations" : "AI Findings"}
+                      </p>
+                      <ul className="list-disc pl-5 space-y-1">
+                        {aiSuggestionList.map((item, index) => (
+                          <li key={`${service.id}-ai-result-${index}`} className="text-sm text-gray-700">
+                            {item.text}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+
+                  {isAIRequest && aiResultValue && typeof aiResultValue === "object" && (
+                    <div className="mt-2 grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs text-gray-700">
+                      {aiResultValue.status && <p><strong>Status:</strong> {String(aiResultValue.status)}</p>}
+                      {aiResultValue.compatibilityPercentage !== undefined && aiResultValue.compatibilityPercentage !== null && <p><strong>Compatibility:</strong> {aiResultValue.compatibilityPercentage}%</p>}
+                      {aiResultValue.safetyPercentage !== undefined && aiResultValue.safetyPercentage !== null && <p><strong>Safety:</strong> {aiResultValue.safetyPercentage}%</p>}
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
 
             {/* Issue Description */}
 
@@ -1713,6 +2111,14 @@ const AdminServices = () => {
                   >
                     <Clock size={16} />
                     Update Status
+                  </button>
+
+                  <button
+                    onClick={() => handleOpenPaymentStatusModal(service)}
+                    className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg border border-blue-200 bg-white text-blue-700 text-sm font-semibold hover:bg-blue-50 transition"
+                  >
+                    <CreditCard size={16} />
+                    Update Payment Status
                   </button>
 
                   <button
@@ -1872,8 +2278,7 @@ const AdminServices = () => {
                     </h2>
 
                     <p className="text-sm text-gray-500 mt-1">
-                      Set the estimated cost, time, and
-                      assigned staff.
+                      The estimated cost was declared with the request. Set the service time and assigned staff.
                     </p>
                   </div>
 
@@ -1906,38 +2311,6 @@ const AdminServices = () => {
                         selectedService.motorcycleDisplay
                       }
                     </p>
-                  </div>
-
-                  <div>
-                    <label className="block text-sm font-semibold text-gray-700 mb-2">
-                      Estimated Cost
-                    </label>
-
-                    <select
-                      value={estimatedCost}
-                      onChange={(e) =>
-                        setEstimatedCost(
-                          e.target.value
-                        )
-                      }
-                      className="w-full px-4 py-3 border border-gray-300 rounded-lg bg-white text-gray-900 focus:outline-none focus:ring-2 focus:ring-gray-900"
-                    >
-                      <option value="">
-                        Select estimated cost
-                      </option>
-
-                      {estimatedCostOptions.map(
-                        (cost) => (
-                          <option
-                            key={cost}
-                            value={cost}
-                          >
-                            ₱
-                            {cost.toLocaleString()}
-                          </option>
-                        )
-                      )}
-                    </select>
                   </div>
 
                   <div>
@@ -2103,6 +2476,65 @@ const AdminServices = () => {
               </div>
             </div>
           )}
+
+        {/* ===================================================== */}
+        {/* PAYMENT STATUS MODAL */}
+        {/* ===================================================== */}
+
+        {showPaymentStatusModal && selectedService && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+            <div className="w-full max-w-md bg-white rounded-2xl shadow-xl overflow-hidden">
+              <div className="flex items-center justify-between px-6 py-5 border-b border-gray-200">
+                <div>
+                  <h2 className="text-lg font-bold text-gray-900">Update Payment Status</h2>
+                  <p className="text-sm text-gray-500 mt-1">{selectedService.serviceType || "Service Request"}</p>
+                </div>
+                <button
+                  onClick={() => setShowPaymentStatusModal(false)}
+                  disabled={savingPaymentStatus}
+                  className="p-2 rounded-lg text-gray-400 hover:text-gray-700 hover:bg-gray-100 disabled:opacity-50"
+                  aria-label="Close payment status modal"
+                >
+                  <X size={20} />
+                </button>
+              </div>
+
+              <div className="p-6 space-y-3">
+                <label className="block text-sm font-semibold text-gray-700" htmlFor="service-payment-status">
+                  Payment Status
+                </label>
+                <select
+                  id="service-payment-status"
+                  value={newPaymentStatus}
+                  onChange={(event) => setNewPaymentStatus(event.target.value)}
+                  className="w-full px-4 py-3 border border-gray-300 rounded-lg bg-white text-gray-900 focus:outline-none focus:ring-2 focus:ring-gray-900"
+                >
+                  <option value="Not Yet Paid">Not Yet Paid</option>
+                  <option value="Partially Paid">Partially Paid</option>
+                  <option value="Paid">Paid</option>
+                </select>
+                <p className="text-xs text-gray-500">This updates the payment status shown in the customer’s My Services screen.</p>
+              </div>
+
+              <div className="flex justify-end gap-3 px-6 py-4 bg-gray-50 border-t border-gray-200">
+                <button
+                  onClick={() => setShowPaymentStatusModal(false)}
+                  disabled={savingPaymentStatus}
+                  className="px-5 py-2.5 rounded-lg border border-gray-300 bg-white text-gray-700 text-sm font-semibold hover:bg-gray-100 disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleSavePaymentStatus}
+                  disabled={savingPaymentStatus}
+                  className="px-5 py-2.5 rounded-lg bg-[#0a0f1a] text-white text-sm font-semibold hover:bg-gray-800 disabled:opacity-50"
+                >
+                  {savingPaymentStatus ? "Saving..." : "Save Payment Status"}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* ===================================================== */}
         {/* STATUS MODAL */}
