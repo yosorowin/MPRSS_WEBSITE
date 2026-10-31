@@ -127,6 +127,15 @@ function AdminDashboard() {
         return value.toDate().toISOString().split("T")[0];
       }
 
+      // Firestore Timestamp values may arrive from serialized data as
+      // plain objects containing seconds and nanoseconds.
+      if (
+        typeof value === "object" &&
+        typeof value.seconds === "number"
+      ) {
+        return new Date(value.seconds * 1000).toISOString().split("T")[0];
+      }
+
       if (value instanceof Date) {
         return value.toISOString().split("T")[0];
       }
@@ -228,22 +237,17 @@ function AdminDashboard() {
         ? service.motorcycle
         : formatMotorcycle(motorcycleData));
 
-    const requestDate =
-      service.requestDate ||
-      service.createdDate ||
-      formatDate(service.createdAt);
+    const requestDate = formatDate(
+      service.requestDate || service.createdDate || service.createdAt
+    );
 
-    const preferredDate =
-      service.preferredDate ||
-      service.date ||
-      service.scheduleDate ||
-      "";
+    const preferredDate = formatDate(
+      service.preferredDate || service.date || service.scheduleDate
+    );
 
-    const preferredTime =
-      service.preferredTime ||
-      service.time ||
-      service.scheduleTime ||
-      "";
+    const preferredTime = formatDate(
+      service.preferredTime || service.time || service.scheduleTime
+    );
 
     const cost = Number(
       service.cost ??
@@ -253,7 +257,11 @@ function AdminDashboard() {
         0
     );
 
-    const rating = Number(service.rating || 0);
+    const rawRating = Number(service.rating || 0);
+    // Keep malformed Firestore ratings from causing a render error in repeat().
+    const rating = Number.isFinite(rawRating)
+      ? Math.max(0, Math.min(5, Math.floor(rawRating)))
+      : 0;
 
     return {
       ...service,
